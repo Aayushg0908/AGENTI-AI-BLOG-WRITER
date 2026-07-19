@@ -40,4 +40,6 @@ python app.py
 
 
 
+ollama list
 
+ollama pull llama3.1:8b
