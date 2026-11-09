@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
+from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, TypedDict
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -139,49 +141,73 @@ def llm_for(config: Optional[RunnableConfig] = None):
     return _user_groq_llm(key) if key else llm
 
 
+RATE_LIMIT_RETRIES = max(0, int(os.getenv("RATE_LIMIT_RETRIES", "8")))
+MAX_RATE_LIMIT_WAIT = 90.0  # seconds; longer waits (e.g. daily quota) fail fast instead
+_RETRY_AFTER_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", re.I)
+
+
+def _rate_limit_wait(error: Exception, attempt: int) -> Optional[float]:
+    """Seconds to wait before retrying a rate-limited call, or None if not a rate limit."""
+    text = str(error)
+    if getattr(error, "status_code", None) != 429 and "429" not in text and "rate limit" not in text.lower():
+        return None
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        hours, minutes, seconds = match.groups()
+        wait = int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds)
+    else:
+        wait = 2.0 ** attempt
+    return wait + random.uniform(0.5, 2.0)
+
+
+def _with_retries(label: str, call: Callable[[], Any]) -> Any:
+    """Run an LLM call with retries.
+
+    - Rate limits (HTTP 429): wait as long as the provider asks, up to RATE_LIMIT_RETRIES times.
+    - Other errors / empty output: up to LLM_RETRIES attempts.
+    """
+    failures = 0
+    rate_limited = 0
+    last_error: Exception | None = None
+
+    while True:
+        try:
+            result = call()
+            if result:
+                return result
+            last_error = ValueError("model returned empty output")
+        except Exception as error:  # noqa: BLE001 - provider errors vary
+            wait = _rate_limit_wait(error, rate_limited + 1)
+            if wait is not None and rate_limited < RATE_LIMIT_RETRIES and wait <= MAX_RATE_LIMIT_WAIT:
+                rate_limited += 1
+                logger.warning("%s rate-limited; waiting %.1fs (%d/%d)", label, wait, rate_limited, RATE_LIMIT_RETRIES)
+                time.sleep(wait)
+                continue
+            last_error = error
+
+        failures += 1
+        logger.warning("%s attempt %d/%d failed: %s", label, failures, LLM_RETRIES, last_error)
+        if failures >= LLM_RETRIES:
+            raise RuntimeError(f"{label} generation failed after {failures} attempts: {last_error}")
+
+
 def invoke_structured(config: Optional[RunnableConfig], schema: type[BaseModel], messages: list) -> Any:
     """Structured-output call with retries (also retries empty results)."""
     runnable = llm_for(config).with_structured_output(schema)
-    last_error: Exception | None = None
-
-    for attempt in range(1, LLM_RETRIES + 1):
-        try:
-            result = runnable.invoke(messages)
-            if result is not None:
-                return result
-            last_error = ValueError("model returned no structured output")
-        except Exception as error:  # noqa: BLE001 - provider errors vary
-            last_error = error
-        logger.warning(
-            "%s attempt %d/%d failed: %s",
-            schema.__name__, attempt, LLM_RETRIES, last_error,
-        )
-
-    raise RuntimeError(
-        f"{schema.__name__} generation failed after {LLM_RETRIES} attempts: {last_error}"
-    )
+    return _with_retries(schema.__name__, lambda: runnable.invoke(messages))
 
 
 def invoke_text(config: Optional[RunnableConfig], messages: list) -> str:
-    last_error: Exception | None = None
+    def call() -> str:
+        content = llm_for(config).invoke(messages).content
+        if isinstance(content, list):  # some providers return content blocks
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content).strip()
 
-    for attempt in range(1, LLM_RETRIES + 1):
-        try:
-            content = llm_for(config).invoke(messages).content
-            if isinstance(content, list):  # some providers return content blocks
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
-            content = str(content).strip()
-            if content:
-                return content
-            last_error = ValueError("model returned empty text")
-        except Exception as error:  # noqa: BLE001
-            last_error = error
-        logger.warning("Text attempt %d/%d failed: %s", attempt, LLM_RETRIES, last_error)
-
-    raise RuntimeError(f"Text generation failed after {LLM_RETRIES} attempts: {last_error}")
+    return _with_retries("Text", call)
 
 
 # =============================================================

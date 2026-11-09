@@ -161,8 +161,13 @@ def check_run_id(run_id: str) -> str:
     return run_id
 
 
+MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "2")))
+
+
 def run_config(run_id: str) -> dict:
-    return {"configurable": {"thread_id": run_id}}
+    # max_concurrency caps how many section writers call the LLM at once
+    # (Groq's free tier allows ~8k tokens/minute).
+    return {"configurable": {"thread_id": run_id}, "max_concurrency": MAX_CONCURRENCY}
 
 
 def pending_review(run_id: str) -> Optional[dict]:
