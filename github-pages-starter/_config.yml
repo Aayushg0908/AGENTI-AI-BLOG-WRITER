@@ -1,0 +1,6 @@
+title: My Tech Blog
+description: Technical articles researched and written with AgentWriter AI.
+theme: minima
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag

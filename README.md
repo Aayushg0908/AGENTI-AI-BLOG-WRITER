@@ -112,12 +112,39 @@ uvicorn app:app --reload
 
 Open http://127.0.0.1:8000, enter a topic, pick audience/tone/length, and approve the outline when it appears.
 
+## 📣 Publishing (GitHub Pages + dev.to)
+
+After an article is finished, the **Publish** card lets each user publish to **their own** accounts:
+
+1. **GitHub Pages** goes first. The article is committed to `_posts/YYYY-MM-DD-<slug>.md` (or `_drafts/`) in the user's Pages repo and served at `/posts/<slug>/`, with Mermaid rendered in the browser. Start a site from [`github-pages-starter/`](github-pages-starter/).
+2. **dev.to** follows, using the GitHub Pages URL as its canonical URL. Mermaid diagrams are converted to images.
+
+For each platform the user picks an account:
+
+- **My own account:** the user enters their GitHub repo + fine-grained token (*Contents: Read and write* on that repo only) and/or their dev.to API key. Credentials are sent only with the publish request and never stored on the server. "Remember on this device" keeps them in that user's browser.
+- **Default account:** publishes to the site owner's blog / dev.to, configured on the server. It's offered only when configured, and requires `PUBLISH_PASSWORD`, so strangers can't post to the owner's accounts. Tokens are never sent to the browser.
+
+| Variable (server) | Purpose |
+|---|---|
+| `PUBLISH_PASSWORD` | Required for the default account. Without it, only "my own account" is offered |
+| `DEFAULT_GITHUB_TOKEN` / `DEFAULT_GITHUB_REPO` | Owner's fine-grained token and `owner/owner.github.io` |
+| `DEFAULT_GITHUB_BRANCH` / `DEFAULT_GITHUB_BASE_URL` | Optional (default `main`; base URL only for custom domains) |
+| `DEFAULT_DEVTO_API_KEY` | Owner's dev.to API key |
+
+Re-publishing an article doesn't create duplicates: a draft is promoted in place.
+
+## 🔑 Bring your own API keys
+
+The composer has an optional **"Use your own API keys"** section. A user can paste their own **Groq** and **Tavily** keys; empty fields fall back to the server's `GROQ_API_KEY` / `TAVILY_API_KEY`. User keys are held in memory only for the duration of that run, never written to checkpoints, the database or output files, and can optionally be remembered in the user's own browser.
+
 ## 📁 Project Structure
 
 ```text
 .
 ├── app.py                 # FastAPI server, SSE streaming, resume endpoint
 ├── backend.py             # LangGraph agents and graph
+├── publishers.py          # GitHub Pages + dev.to publishing
+├── github-pages-starter/  # Jekyll site to copy into your Pages repo
 ├── requirements.txt
 ├── static/                # CSS/JS frontend assets
 ├── templates/             # Jinja HTML template
@@ -130,9 +157,11 @@ Open http://127.0.0.1:8000, enter a topic, pick audience/tone/length, and approv
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/run` | Start a run: `{topic, audience?, tone?, length: short\|medium\|long, require_approval}`. Streams events |
+| `POST` | `/api/run` | Start a run: `{topic, audience?, tone?, length: short\|medium\|long, require_approval, groq_api_key?, tavily_api_key?}`. Streams events |
 | `POST` | `/api/runs/{run_id}/resume` | Approve (optionally with an edited plan) or regenerate with feedback: `{action: "approve"\|"regenerate", plan?, feedback?}` |
 | `GET` | `/api/runs/{run_id}/download` | Download the article as `<slug>.md` |
+| `GET` | `/api/publishers` | Which default accounts are available (no secrets) |
+| `POST` | `/api/runs/{run_id}/publish` | `{platforms, mode: "draft"\|"publish", github?: {use_default} \| {repo, token, branch?, base_url?}, devto?: {use_default} \| {api_key}}`; header `X-Publish-Password` when using a default account |
 | `GET` | `/api/health` | Server status, active LLM and checkpointer type |
 
 ## 📄 License

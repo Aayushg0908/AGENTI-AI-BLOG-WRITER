@@ -14,6 +14,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 from urllib.parse import urlparse
@@ -95,9 +96,52 @@ LLM_PROVIDER, llm = build_llm()
 LLM_DESCRIPTION = f"{LLM_PROVIDER}:{getattr(llm, 'model', None) or getattr(llm, 'model_name', '')}"
 
 
-def invoke_structured(schema: type[BaseModel], messages: list) -> Any:
+# -------------------------------------------------------------
+# Per-run user keys ("bring your own key").
+# Held in process memory only, keyed by run id. Never written to graph state,
+# checkpoints or output files. Empty -> the server's own keys are used.
+# -------------------------------------------------------------
+_RUN_KEYS: Dict[str, Dict[str, str]] = {}
+
+
+def set_run_keys(run_id: str, keys: Optional[Dict[str, str]]) -> None:
+    clean = {k: v.strip() for k, v in (keys or {}).items() if isinstance(v, str) and v.strip()}
+    if clean:
+        _RUN_KEYS[run_id] = clean
+    else:
+        _RUN_KEYS.pop(run_id, None)
+
+
+def clear_run_keys(run_id: str) -> None:
+    _RUN_KEYS.pop(run_id, None)
+
+
+def _run_keys(config: Optional[RunnableConfig]) -> Dict[str, str]:
+    thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+    return _RUN_KEYS.get(str(thread_id), {}) if thread_id else {}
+
+
+@lru_cache(maxsize=32)
+def _user_groq_llm(api_key: str):
+    from langchain_groq import ChatGroq
+
+    model = os.getenv("LLM_MODEL", "").strip() if LLM_PROVIDER == "groq" else ""
+    return ChatGroq(
+        model=model or "openai/gpt-oss-120b",
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0")),
+        api_key=api_key,
+    )
+
+
+def llm_for(config: Optional[RunnableConfig] = None):
+    """The user's own Groq key if they supplied one for this run, else the server LLM."""
+    key = _run_keys(config).get("groq_api_key")
+    return _user_groq_llm(key) if key else llm
+
+
+def invoke_structured(config: Optional[RunnableConfig], schema: type[BaseModel], messages: list) -> Any:
     """Structured-output call with retries (also retries empty results)."""
-    runnable = llm.with_structured_output(schema)
+    runnable = llm_for(config).with_structured_output(schema)
     last_error: Exception | None = None
 
     for attempt in range(1, LLM_RETRIES + 1):
@@ -118,12 +162,12 @@ def invoke_structured(schema: type[BaseModel], messages: list) -> Any:
     )
 
 
-def invoke_text(messages: list) -> str:
+def invoke_text(config: Optional[RunnableConfig], messages: list) -> str:
     last_error: Exception | None = None
 
     for attempt in range(1, LLM_RETRIES + 1):
         try:
-            content = llm.invoke(messages).content
+            content = llm_for(config).invoke(messages).content
             if isinstance(content, list):  # some providers return content blocks
                 content = "".join(
                     part.get("text", "") if isinstance(part, dict) else str(part)
@@ -221,7 +265,7 @@ class SeoPack(BaseModel):
     meta_description: str = Field(..., description="Meta description, 140–160 characters.")
     slug: str = Field(..., description="URL slug: lowercase words joined by hyphens.")
     keywords: List[str] = Field(default_factory=list, description="5–10 search keywords.")
-    tags: List[str] = Field(default_factory=list, description="3–5 platform tags (dev.to/Hashnode style).")
+    tags: List[str] = Field(default_factory=list, description="3–5 platform tags (dev.to style).")
     summary: str = Field(..., description="2–3 sentence summary / TL;DR.")
     social_post: str = Field(..., description="Short LinkedIn/X post announcing the article, max 280 characters.")
 
@@ -387,9 +431,10 @@ recency_days (how fresh sources must be):
 """
 
 
-def router_node(state: State) -> dict:
+def router_node(state: State, config: RunnableConfig) -> dict:
     as_of = _today(state).isoformat()
     decision: RouterDecision = invoke_structured(
+        config,
         RouterDecision,
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -434,18 +479,29 @@ def _time_range_for(days: Optional[int]) -> Optional[str]:
     return None
 
 
-def _tavily_search(query: str, *, max_results: int, topic: str, time_range: Optional[str]) -> List[dict]:
+def _tavily_search(
+    query: str,
+    *,
+    max_results: int,
+    topic: str,
+    time_range: Optional[str],
+    api_key: Optional[str] = None,
+) -> tuple[List[dict], Optional[str]]:
+    """Return (results, error). One failed query should not kill research."""
     from langchain_tavily import TavilySearch
 
     try:
-        tool = TavilySearch(max_results=max_results, topic=topic, time_range=time_range)
+        extra = {"tavily_api_key": api_key} if api_key else {}
+        tool = TavilySearch(max_results=max_results, topic=topic, time_range=time_range, **extra)
         response = tool.invoke({"query": query})
-    except Exception as error:  # noqa: BLE001 - one failed query should not kill research
+    except Exception as error:  # noqa: BLE001
         logger.warning("Tavily query failed (%s): %s", query, error)
-        return []
+        return [], str(error)
 
     if not isinstance(response, dict):
-        return []
+        return [], "unexpected Tavily response"
+    if response.get("error"):
+        return [], str(response["error"])
 
     results = []
     for item in response.get("results") or []:
@@ -461,7 +517,7 @@ def _tavily_search(query: str, *, max_results: int, topic: str, time_range: Opti
                 "source": urlparse(url).netloc,
             }
         )
-    return results
+    return results, None
 
 
 RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
@@ -477,7 +533,7 @@ Rules:
 """
 
 
-def research_node(state: State) -> dict:
+def research_node(state: State, config: RunnableConfig) -> dict:
     queries = (state.get("queries") or [])[:MAX_QUERIES]
     mode = state.get("mode", "hybrid")
     recency_days = state.get("recency_days")
@@ -487,13 +543,21 @@ def research_node(state: State) -> dict:
     if not queries:
         return {"evidence": []}
 
+    user_key = _run_keys(config).get("tavily_api_key")
     with ThreadPoolExecutor(max_workers=min(4, len(queries))) as pool:
-        batches = list(
+        outcomes = list(
             pool.map(
-                lambda q: _tavily_search(q, max_results=6, topic=search_topic, time_range=time_range),
+                lambda q: _tavily_search(
+                    q, max_results=6, topic=search_topic, time_range=time_range, api_key=user_key
+                ),
                 queries,
             )
         )
+    batches = [results for results, _ in outcomes]
+    errors = [error for _, error in outcomes if error]
+    if user_key and errors and len(errors) == len(outcomes):
+        # Tell the user their own key is the problem instead of silently skipping research.
+        raise RuntimeError(f"Web search failed with your Tavily key: {errors[0][:200]}")
 
     # Deduplicate by URL and drop results older than the recency window.
     cutoff = _today(state) - timedelta(days=recency_days) if recency_days else None
@@ -521,6 +585,7 @@ def research_node(state: State) -> dict:
     evidence: List[dict] = []
     try:
         pack: EvidencePack = invoke_structured(
+            config,
             EvidencePack,
             [
                 SystemMessage(content=RESEARCH_SYSTEM),
@@ -596,7 +661,7 @@ Output must strictly match the Plan schema.
 """
 
 
-def orchestrator_node(state: State) -> dict:
+def orchestrator_node(state: State, config: RunnableConfig) -> dict:
     mode = state.get("mode", "closed_book")
     length = state.get("length") or "medium"
     feedback = (state.get("plan_feedback") or "").strip()
@@ -622,6 +687,7 @@ def orchestrator_node(state: State) -> dict:
         ]
 
     plan: Plan = invoke_structured(
+        config,
         Plan,
         [SystemMessage(content=ORCH_SYSTEM), HumanMessage(content="\n".join(parts))],
     )
@@ -723,7 +789,7 @@ def _clean_section(markdown: str, title: str) -> str:
     return text
 
 
-def _write_section(payload: dict, *, issues: Optional[List[str]] = None, previous_draft: str = "") -> str:
+def _write_section(payload: dict, config: Optional[RunnableConfig], *, issues: Optional[List[str]] = None, previous_draft: str = "") -> str:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = payload.get("evidence") or []
@@ -758,19 +824,20 @@ def _write_section(payload: dict, *, issues: Optional[List[str]] = None, previou
             + f"\n\nPrevious draft:\n{previous_draft}\n"
         )
 
-    raw = invoke_text([SystemMessage(content=WORKER_SYSTEM), HumanMessage(content=content)])
+    raw = invoke_text(config, [SystemMessage(content=WORKER_SYSTEM), HumanMessage(content=content)])
     return _clean_section(raw, task.title)
 
 
-def worker_node(payload: dict) -> dict:
+def worker_node(payload: dict, config: RunnableConfig) -> dict:
     task_id = str(payload["task"]["id"])
-    return {"sections": {task_id: _write_section(payload)}}
+    return {"sections": {task_id: _write_section(payload, config)}}
 
 
-def reviser_node(payload: dict) -> dict:
+def reviser_node(payload: dict, config: RunnableConfig) -> dict:
     task_id = str(payload["task"]["id"])
     revised = _write_section(
         payload,
+        config,
         issues=payload.get("issues") or [],
         previous_draft=payload.get("previous_draft") or "",
     )
@@ -811,7 +878,7 @@ def _rule_based_issues(task: Task, markdown: str) -> List[str]:
     return issues
 
 
-def editor_review_node(state: State) -> dict:
+def editor_review_node(state: State, config: RunnableConfig) -> dict:
     plan = _plan(state)
     sections = state.get("sections") or {}
     review_round = (state.get("review_round") or 0) + 1
@@ -828,6 +895,7 @@ def editor_review_node(state: State) -> dict:
 
     try:
         report: ReviewReport = invoke_structured(
+            config,
             ReviewReport,
             [
                 SystemMessage(content=EDITOR_SYSTEM),
@@ -993,7 +1061,7 @@ def _heading_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
-def diagrams_node(state: State) -> dict:
+def diagrams_node(state: State, config: RunnableConfig) -> dict:
     md = state["merged_md"]
     lines = md.split("\n")
 
@@ -1011,6 +1079,7 @@ def diagrams_node(state: State) -> dict:
 
     try:
         plan: DiagramPlan = invoke_structured(
+            config,
             DiagramPlan,
             [
                 SystemMessage(content=DIAGRAM_SYSTEM),
@@ -1074,7 +1143,7 @@ def diagrams_node(state: State) -> dict:
 # 12) SEO / publishing agent
 # =============================================================
 SEO_SYSTEM = """You are an SEO editor preparing a technical article for publishing on a blog,
-dev.to, Hashnode and Medium.
+GitHub Pages and dev.to.
 
 Produce:
 - seo_title: compelling, specific, max 60 characters.
@@ -1088,12 +1157,13 @@ Do not promise anything the article does not deliver.
 """
 
 
-def seo_node(state: State) -> dict:
+def seo_node(state: State, config: RunnableConfig) -> dict:
     plan = _plan(state)
     md = state.get("md_with_diagrams") or state["merged_md"]
 
     try:
         seo: SeoPack = invoke_structured(
+            config,
             SeoPack,
             [
                 SystemMessage(content=SEO_SYSTEM),

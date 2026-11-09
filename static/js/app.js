@@ -34,6 +34,39 @@ const downloadButton = document.getElementById("downloadButton");
 const seoCard = document.getElementById("seoCard");
 const seoFields = document.getElementById("seoFields");
 
+const publishCard = document.getElementById("publishCard");
+const publishMode = document.getElementById("publishMode");
+const publishButton = document.getElementById("publishButton");
+const publishResults = document.getElementById("publishResults");
+const publishGithub = document.getElementById("publishGithub");
+const publishDevto = document.getElementById("publishDevto");
+const githubRepo = document.getElementById("githubRepo");
+const githubBranch = document.getElementById("githubBranch");
+const githubToken = document.getElementById("githubToken");
+const githubBaseUrl = document.getElementById("githubBaseUrl");
+const devtoKey = document.getElementById("devtoKey");
+const rememberCreds = document.getElementById("rememberCreds");
+const publishPassword = document.getElementById("publishPassword");
+const defaultPasswordField = document.getElementById("defaultPasswordField");
+
+const groqKeyInput = document.getElementById("groqKeyInput");
+const tavilyKeyInput = document.getElementById("tavilyKeyInput");
+const rememberApiKeys = document.getElementById("rememberApiKeys");
+const byokStatus = document.getElementById("byokStatus");
+const API_KEYS_STORAGE_KEY = "agentwriter.apiKeys";
+
+let publisherDefaults = { github: { available: false }, devto: { available: false } };
+
+const PLATFORM_LABELS = {
+    github: "GitHub Pages",
+    devto: "dev.to",
+};
+
+const CREDS_STORAGE_KEY = "agentwriter.publishCredentials";
+const CREDENTIAL_FIELDS = {
+    githubRepo, githubBranch, githubToken, githubBaseUrl, devtoKey,
+};
+
 const healthDot = document.getElementById("healthDot");
 const healthText = document.getElementById("healthText");
 const toast = document.getElementById("toast");
@@ -149,6 +182,9 @@ function resetInterface() {
     seoCard.hidden = true;
     seoFields.innerHTML = "";
 
+    publishCard.hidden = true;
+    publishResults.innerHTML = "";
+
     runBadge.textContent = "Ready";
     runBadge.className = "run-badge";
 
@@ -157,7 +193,7 @@ function resetInterface() {
 
 
 function setRunningState(isRunning) {
-    [topicInput, audienceInput, toneInput, lengthInput, approvalInput].forEach(input => {
+    [topicInput, audienceInput, toneInput, lengthInput, approvalInput, groqKeyInput, tavilyKeyInput].forEach(input => {
         input.disabled = isRunning || awaitingApproval;
     });
 
@@ -650,8 +686,333 @@ async function displayFinalResult(event) {
 
     document.getElementById("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
 
+    showPublishCard();
     await renderMermaid(articlePreview);
 }
+
+
+function showPublishCard() {
+    publishResults.innerHTML = "";
+    publishCard.hidden = false;
+}
+
+
+function loadSavedCredentials() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(CREDS_STORAGE_KEY) || "null");
+
+        if (!saved) {
+            return;
+        }
+
+        Object.entries(CREDENTIAL_FIELDS).forEach(([name, input]) => {
+            if (typeof saved[name] === "string" && saved[name]) {
+                input.value = saved[name];
+            }
+        });
+
+        publishGithub.checked = saved.publishGithub !== false;
+        publishDevto.checked = Boolean(saved.publishDevto);
+        ["github", "devto"].forEach(platform => {
+            const choice = saved[`${platform}Account`] === "default" ? "default" : "own";
+            document.querySelector(`input[name="${platform}Account"][value="${choice}"]`).checked = true;
+        });
+        rememberCreds.checked = true;
+    } catch {
+        // storage unavailable: fields simply start empty
+    }
+}
+
+
+function saveOrForgetCredentials() {
+    try {
+        if (!rememberCreds.checked) {
+            localStorage.removeItem(CREDS_STORAGE_KEY);
+            return;
+        }
+
+        const values = Object.fromEntries(
+            Object.entries(CREDENTIAL_FIELDS).map(([name, input]) => [name, input.value.trim()]),
+        );
+
+        values.publishGithub = publishGithub.checked;
+        values.publishDevto = publishDevto.checked;
+        values.githubAccount = accountChoice("github");
+        values.devtoAccount = accountChoice("devto");
+        localStorage.setItem(CREDS_STORAGE_KEY, JSON.stringify(values));
+    } catch {
+        // storage unavailable
+    }
+}
+
+
+rememberCreds.addEventListener("change", saveOrForgetCredentials);
+
+
+function accountChoice(platform) {
+    const checked = document.querySelector(`input[name="${platform}Account"]:checked`);
+    return checked ? checked.value : "own";
+}
+
+
+function updateAccountUI() {
+    ["github", "devto"].forEach(platform => {
+        const useDefault = accountChoice(platform) === "default";
+
+        document.querySelector(`.own-fields[data-platform="${platform}"]`).hidden = useDefault;
+        document.querySelector(`.default-target[data-platform="${platform}"]`).hidden = !useDefault;
+    });
+
+    const needsPassword = (publishGithub.checked && accountChoice("github") === "default")
+        || (publishDevto.checked && accountChoice("devto") === "default");
+
+    defaultPasswordField.hidden = !needsPassword;
+}
+
+
+document.querySelectorAll('.account-choice input, #publishGithub, #publishDevto').forEach(input => {
+    input.addEventListener("change", updateAccountUI);
+});
+
+
+async function loadPublisherDefaults() {
+    try {
+        const response = await fetch("/api/publishers");
+
+        if (response.ok) {
+            publisherDefaults = (await response.json()).defaults || publisherDefaults;
+        }
+    } catch {
+        // defaults stay unavailable
+    }
+
+    const github = publisherDefaults.github || {};
+    const devto = publisherDefaults.devto || {};
+
+    document.querySelector('.account-choice[data-platform="github"] .default-option').hidden = !github.available;
+    document.querySelector('.account-choice[data-platform="devto"] .default-option').hidden = !devto.available;
+
+    document.querySelector('.default-target[data-platform="github"]').textContent =
+        github.site_url ? `Publishes to ${github.site_url}` : "Publishes to the site's default blog.";
+    document.querySelector('.default-target[data-platform="devto"]').textContent =
+        "Publishes to the site's dev.to account.";
+
+    // A remembered "default" choice is invalid if the server no longer offers it.
+    ["github", "devto"].forEach(platform => {
+        if (!publisherDefaults[platform]?.available && accountChoice(platform) === "default") {
+            document.querySelector(`input[name="${platform}Account"][value="own"]`).checked = true;
+        }
+    });
+
+    updateAccountUI();
+}
+
+
+function collectPublishRequest() {
+    const platforms = [];
+    const body = { mode: publishMode.value };
+    let usesDefault = false;
+
+    if (publishGithub.checked) {
+        platforms.push("github");
+
+        if (accountChoice("github") === "default") {
+            usesDefault = true;
+            body.github = { use_default: true };
+        } else {
+            const repo = githubRepo.value.trim()
+                .replace(/^https:\/\/github\.com\//, "")
+                .replace(/\.git$/, "")
+                .replace(/\/$/, "");
+
+            if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
+                githubRepo.focus();
+                throw new Error("Enter your GitHub repo as username/repo, e.g. jane/jane.github.io.");
+            }
+
+            if (!githubToken.value.trim()) {
+                githubToken.focus();
+                throw new Error("Enter a GitHub access token.");
+            }
+
+            githubRepo.value = repo;
+            body.github = {
+                repo,
+                token: githubToken.value.trim(),
+                branch: githubBranch.value.trim() || "main",
+                base_url: githubBaseUrl.value.trim(),
+            };
+        }
+    }
+
+    if (publishDevto.checked) {
+        platforms.push("devto");
+
+        if (accountChoice("devto") === "default") {
+            usesDefault = true;
+            body.devto = { use_default: true };
+        } else {
+            if (!devtoKey.value.trim()) {
+                devtoKey.focus();
+                throw new Error("Enter your dev.to API key.");
+            }
+
+            body.devto = { api_key: devtoKey.value.trim() };
+        }
+    }
+
+    if (!platforms.length) {
+        throw new Error("Pick at least one platform.");
+    }
+
+    if (usesDefault && !publishPassword.value) {
+        publishPassword.focus();
+        throw new Error("Enter the password for the default account.");
+    }
+
+    body.platforms = platforms;
+    return { body, usesDefault };
+}
+
+
+function apiKeysBody() {
+    return {
+        groq_api_key: groqKeyInput.value.trim(),
+        tavily_api_key: tavilyKeyInput.value.trim(),
+    };
+}
+
+
+function updateByokStatus() {
+    const own = [
+        groqKeyInput.value.trim() && "Groq",
+        tavilyKeyInput.value.trim() && "Tavily",
+    ].filter(Boolean);
+
+    byokStatus.textContent = own.length
+        ? `using your ${own.join(" + ")} key${own.length > 1 ? "s" : ""}`
+        : "optional · using the site's keys";
+    byokStatus.classList.toggle("active", own.length > 0);
+}
+
+
+function saveOrForgetApiKeys() {
+    try {
+        if (rememberApiKeys.checked) {
+            localStorage.setItem(API_KEYS_STORAGE_KEY, JSON.stringify(apiKeysBody()));
+        } else {
+            localStorage.removeItem(API_KEYS_STORAGE_KEY);
+        }
+    } catch {
+        // storage unavailable
+    }
+}
+
+
+function loadApiKeys() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(API_KEYS_STORAGE_KEY) || "null");
+
+        if (saved) {
+            groqKeyInput.value = saved.groq_api_key || "";
+            tavilyKeyInput.value = saved.tavily_api_key || "";
+            rememberApiKeys.checked = true;
+        }
+    } catch {
+        // storage unavailable
+    }
+
+    updateByokStatus();
+}
+
+
+[groqKeyInput, tavilyKeyInput].forEach(input => {
+    input.addEventListener("input", () => {
+        updateByokStatus();
+        if (rememberApiKeys.checked) {
+            saveOrForgetApiKeys();
+        }
+    });
+});
+
+rememberApiKeys.addEventListener("change", saveOrForgetApiKeys);
+
+
+function showPublishResults(results) {
+    publishResults.innerHTML = Object.entries(results).map(([platform, result]) => {
+        const label = escapeHtml(PLATFORM_LABELS[platform] || platform);
+
+        if (!result.ok) {
+            return `<div class="publish-result failed"><strong>${label}</strong><span>${escapeHtml(result.error)}</span></div>`;
+        }
+
+        const link = result.url
+            ? `<a href="${escapeHtml(result.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(result.url)}</a>`
+            : "";
+
+        return `
+            <div class="publish-result ok">
+                <strong>${label} · ${result.mode === "publish" ? "published" : "draft"}</strong>
+                ${link}
+                ${result.note ? `<small>${escapeHtml(result.note)}</small>` : ""}
+            </div>
+        `;
+    }).join("");
+}
+
+
+publishButton.addEventListener("click", async () => {
+    if (!currentRunId) {
+        return;
+    }
+
+    let body;
+    let usesDefault;
+
+    try {
+        ({ body, usesDefault } = collectPublishRequest());
+    } catch (error) {
+        showToast(error.message);
+        return;
+    }
+
+    if (
+        body.mode === "publish"
+        && !window.confirm(`Publish publicly to ${body.platforms.map(p => PLATFORM_LABELS[p]).join(" and ")}?`)
+    ) {
+        return;
+    }
+
+    saveOrForgetCredentials();
+    publishButton.disabled = true;
+    publishResults.innerHTML = '<p class="publish-hint">Publishing…</p>';
+
+    try {
+        const response = await fetch(`/api/runs/${currentRunId}/publish`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(usesDefault ? { "X-Publish-Password": publishPassword.value } : {}),
+            },
+            body: JSON.stringify(body),
+        });
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            const detail = Array.isArray(data.detail)
+                ? data.detail.map(item => item.msg).join("; ")
+                : data.detail;
+            throw new Error(detail || "Publishing failed.");
+        }
+
+        showPublishResults(data.results || {});
+        showToast("Publishing finished.");
+    } catch (error) {
+        publishResults.innerHTML = `<p class="publish-hint error">${escapeHtml(error.message)}</p>`;
+    } finally {
+        publishButton.disabled = false;
+    }
+});
 
 
 function showSeo(seo) {
@@ -908,6 +1269,7 @@ runForm.addEventListener("submit", async event => {
         tone: toneInput.value,
         length: lengthInput.value,
         require_approval: approvalInput.checked,
+        ...apiKeysBody(),
     });
 });
 
@@ -930,7 +1292,7 @@ approveButton.addEventListener("click", async () => {
     planReview.hidden = true;
     showPlan(plan);
 
-    await runStream(`/api/runs/${currentRunId}/resume`, { action: "approve", plan });
+    await runStream(`/api/runs/${currentRunId}/resume`, { action: "approve", plan, ...apiKeysBody() });
 });
 
 
@@ -951,7 +1313,7 @@ regenerateButton.addEventListener("click", async () => {
     planReview.hidden = true;
     planFeedback.value = "";
 
-    await runStream(`/api/runs/${currentRunId}/resume`, { action: "regenerate", feedback });
+    await runStream(`/api/runs/${currentRunId}/resume`, { action: "regenerate", feedback, ...apiKeysBody() });
 });
 
 
@@ -1037,3 +1399,6 @@ async function checkHealth() {
 
 resetInterface();
 checkHealth();
+loadSavedCredentials();
+loadApiKeys();
+loadPublisherDefaults();

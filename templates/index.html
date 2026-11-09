@@ -103,6 +103,11 @@
                     <span>08</span>
                     SEO pack
                 </div>
+
+                <div class="workflow-item">
+                    <span>09</span>
+                    Publish
+                </div>
             </div>
 
             <div class="server-status">
@@ -206,6 +211,47 @@
                             <span>Review outline before writing</span>
                         </label>
                     </div>
+
+                    <details id="byokPanel" class="byok-panel">
+                        <summary>
+                            Use your own API keys
+                            <span id="byokStatus" class="byok-status">optional · using the site's keys</span>
+                        </summary>
+
+                        <p class="byok-note">
+                            Leave empty to use this site's keys. Your keys are used only for
+                            your runs and are never saved on the server.
+                        </p>
+
+                        <div class="byok-fields">
+                            <label class="field">
+                                <span>Groq API key</span>
+                                <input
+                                    id="groqKeyInput"
+                                    type="password"
+                                    maxlength="300"
+                                    autocomplete="off"
+                                    placeholder="gsk_… (console.groq.com/keys)"
+                                >
+                            </label>
+
+                            <label class="field">
+                                <span>Tavily API key</span>
+                                <input
+                                    id="tavilyKeyInput"
+                                    type="password"
+                                    maxlength="300"
+                                    autocomplete="off"
+                                    placeholder="tvly-… (app.tavily.com)"
+                                >
+                            </label>
+                        </div>
+
+                        <label class="toggle-field">
+                            <input id="rememberApiKeys" type="checkbox">
+                            <span>Remember on this device (saved in this browser only)</span>
+                        </label>
+                    </details>
 
                     <div class="composer-footer">
                         <div class="examples">
@@ -478,6 +524,173 @@
                 <div
                     id="seoFields"
                     class="seo-fields"
+                ></div>
+            </section>
+
+            <section
+                id="publishCard"
+                class="panel-card publish-card"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <span class="panel-label">
+                            Distribution
+                        </span>
+
+                        <h2>Publish</h2>
+                    </div>
+                </div>
+
+                <p class="publish-note">
+                    Publish to your own accounts, or to the site's default account
+                    (password protected). Your tokens are sent only with the publish
+                    request and are never stored on the server. GitHub Pages goes first
+                    and becomes the canonical URL of the dev.to copy.
+                </p>
+
+                <div class="publish-targets">
+                    <fieldset class="publish-target">
+                        <label class="publish-platform">
+                            <input id="publishGithub" type="checkbox" value="github" checked>
+                            <span>GitHub Pages</span>
+                        </label>
+
+                        <div class="account-choice" data-platform="github">
+                            <label>
+                                <input type="radio" name="githubAccount" value="own" checked>
+                                <span>My own account</span>
+                            </label>
+
+                            <label class="default-option" hidden>
+                                <input type="radio" name="githubAccount" value="default">
+                                <span>Default account</span>
+                            </label>
+                        </div>
+
+                        <p class="default-target" data-platform="github" hidden></p>
+
+                        <div class="publish-fields own-fields" data-platform="github">
+                            <label class="field">
+                                <span>Repository</span>
+                                <input
+                                    id="githubRepo"
+                                    type="text"
+                                    maxlength="200"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                    placeholder="your-username/your-username.github.io"
+                                >
+                            </label>
+
+                            <label class="field">
+                                <span>Branch</span>
+                                <input
+                                    id="githubBranch"
+                                    type="text"
+                                    maxlength="100"
+                                    value="main"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                >
+                            </label>
+
+                            <label class="field">
+                                <span>Access token</span>
+                                <input
+                                    id="githubToken"
+                                    type="password"
+                                    maxlength="300"
+                                    autocomplete="off"
+                                    placeholder="Fine-grained token: Contents read &amp; write"
+                                >
+                            </label>
+
+                            <label class="field">
+                                <span>Site URL (optional)</span>
+                                <input
+                                    id="githubBaseUrl"
+                                    type="url"
+                                    maxlength="300"
+                                    autocomplete="off"
+                                    placeholder="Only for a custom domain"
+                                >
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="publish-target">
+                        <label class="publish-platform">
+                            <input id="publishDevto" type="checkbox" value="devto">
+                            <span>dev.to</span>
+                        </label>
+
+                        <div class="account-choice" data-platform="devto">
+                            <label>
+                                <input type="radio" name="devtoAccount" value="own" checked>
+                                <span>My own account</span>
+                            </label>
+
+                            <label class="default-option" hidden>
+                                <input type="radio" name="devtoAccount" value="default">
+                                <span>Default account</span>
+                            </label>
+                        </div>
+
+                        <p class="default-target" data-platform="devto" hidden></p>
+
+                        <div class="publish-fields single own-fields" data-platform="devto">
+                            <label class="field">
+                                <span>API key</span>
+                                <input
+                                    id="devtoKey"
+                                    type="password"
+                                    maxlength="300"
+                                    autocomplete="off"
+                                    placeholder="dev.to → Settings → Extensions → API Keys"
+                                >
+                            </label>
+                        </div>
+                    </fieldset>
+                </div>
+
+                <label class="toggle-field">
+                    <input id="rememberCreds" type="checkbox">
+                    <span>Remember on this device (saved in this browser only)</span>
+                </label>
+
+                <div class="publish-controls">
+                    <label class="field">
+                        <span>Mode</span>
+                        <select id="publishMode">
+                            <option value="draft" selected>Save as draft</option>
+                            <option value="publish">Publish publicly</option>
+                        </select>
+                    </label>
+
+                    <label id="defaultPasswordField" class="field" hidden>
+                        <span>Default account password</span>
+                        <input
+                            id="publishPassword"
+                            type="password"
+                            autocomplete="off"
+                            placeholder="Required to use the default account"
+                        >
+                    </label>
+
+                    <button
+                        id="publishButton"
+                        class="run-button"
+                        type="button"
+                    >
+                        <span>Publish</span>
+                        <span>➜</span>
+                    </button>
+                </div>
+
+                <div
+                    id="publishResults"
+                    class="publish-results"
                 ></div>
             </section>
         </main>

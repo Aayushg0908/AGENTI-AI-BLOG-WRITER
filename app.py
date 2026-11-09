@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import date
 from pathlib import Path
-from typing import Any, Generator, Literal, Optional
+from typing import Any, Generator, List, Literal, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,8 +25,11 @@ from backend import (
     MAX_REVIEW_ROUNDS,
     OUTPUTS_DIR,
     app as workflow,
+    clear_run_keys,
+    set_run_keys,
     validate_plan,
 )
+from publishers import DevtoCredentials, GithubCredentials, github_site_url, publish_article
 
 # ---------------------------------------------------------
 # Paths / logging
@@ -64,7 +69,17 @@ STAGE_LABELS = {
 # ---------------------------------------------------------
 # Request schemas
 # ---------------------------------------------------------
-class AgentRunRequest(BaseModel):
+class UserKeys(BaseModel):
+    """Optional "bring your own key" fields. Empty -> the server's keys are used."""
+
+    groq_api_key: str = Field("", max_length=300)
+    tavily_api_key: str = Field("", max_length=300)
+
+    def as_dict(self) -> dict:
+        return {"groq_api_key": self.groq_api_key, "tavily_api_key": self.tavily_api_key}
+
+
+class AgentRunRequest(UserKeys):
     topic: str = Field(..., min_length=3, max_length=1000)
     audience: str = Field("", max_length=200)
     tone: str = Field("", max_length=100)
@@ -72,10 +87,32 @@ class AgentRunRequest(BaseModel):
     require_approval: bool = True
 
 
-class ResumeRequest(BaseModel):
+class ResumeRequest(UserKeys):
     action: Literal["approve", "regenerate"] = "approve"
     plan: Optional[dict] = None
     feedback: str = Field("", max_length=2000)
+
+
+class GithubTarget(BaseModel):
+    use_default: bool = False
+    token: str = Field("", max_length=300)
+    repo: str = Field("", max_length=200, description="owner/repo")
+    branch: str = Field("main", max_length=100)
+    base_url: str = Field("", max_length=300)
+
+
+class DevtoTarget(BaseModel):
+    use_default: bool = False
+    api_key: str = Field("", max_length=300)
+
+
+class PublishRequest(BaseModel):
+    """User credentials are used for this request only (never stored)."""
+
+    platforms: List[Literal["github", "devto"]] = Field(..., min_length=1)
+    mode: Literal["draft", "publish"] = "draft"
+    github: Optional[GithubTarget] = None
+    devto: Optional[DevtoTarget] = None
 
 
 # ---------------------------------------------------------
@@ -402,11 +439,16 @@ def run_agent(request_data: AgentRunRequest):
         "review_round": 0,
     }
     ctx = RunContext(run_id, request_data.require_approval)
+    keys = request_data.as_dict()
 
     def generator():
-        yield sse({"type": "run_started", "run_id": run_id, "topic": topic})
-        yield stage("router", "running", "Deciding whether the topic needs current web research.")
-        yield from stream_run(graph_input, ctx)
+        set_run_keys(run_id, keys)
+        try:
+            yield sse({"type": "run_started", "run_id": run_id, "topic": topic})
+            yield stage("router", "running", "Deciding whether the topic needs current web research.")
+            yield from stream_run(graph_input, ctx)
+        finally:
+            clear_run_keys(run_id)
 
     return streaming_response(generator())
 
@@ -430,12 +472,139 @@ def resume_run(run_id: str, request_data: ResumeRequest):
 
     plan = payload.get("plan") or review.get("plan")
     ctx = RunContext(run_id, require_approval=True, plan=plan)
+    keys = request_data.as_dict()
 
     def generator():
-        yield sse({"type": "run_resumed", "run_id": run_id, "action": request_data.action})
-        yield from stream_run(Command(resume=payload), ctx)
+        set_run_keys(run_id, keys)
+        try:
+            yield sse({"type": "run_resumed", "run_id": run_id, "action": request_data.action})
+            yield from stream_run(Command(resume=payload), ctx)
+        finally:
+            clear_run_keys(run_id)
 
     return streaming_response(generator())
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def default_github() -> Optional[GithubCredentials]:
+    """The site owner's GitHub Pages target, configured on the server."""
+    if not (_env("DEFAULT_GITHUB_TOKEN") and _env("DEFAULT_GITHUB_REPO") and _env("PUBLISH_PASSWORD")):
+        return None
+    return GithubCredentials(
+        token=_env("DEFAULT_GITHUB_TOKEN"),
+        repo=_env("DEFAULT_GITHUB_REPO"),
+        branch=_env("DEFAULT_GITHUB_BRANCH", "main") or "main",
+        base_url=_env("DEFAULT_GITHUB_BASE_URL"),
+    )
+
+
+def default_devto() -> Optional[DevtoCredentials]:
+    if not (_env("DEFAULT_DEVTO_API_KEY") and _env("PUBLISH_PASSWORD")):
+        return None
+    return DevtoCredentials(api_key=_env("DEFAULT_DEVTO_API_KEY"))
+
+
+@app.get("/api/publishers")
+def list_publishers():
+    """What the UI may offer as "default account" (never exposes tokens)."""
+    github = default_github()
+    return {
+        "defaults": {
+            "github": {"available": github is not None, "site_url": github_site_url(github) if github else ""},
+            "devto": {"available": default_devto() is not None},
+        }
+    }
+
+
+def _check_publish_password(given: str) -> None:
+    expected = _env("PUBLISH_PASSWORD")
+    if not expected:
+        raise HTTPException(status_code=403, detail="The default account is not enabled on this server.")
+    if not hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Wrong publish password for the default account.")
+
+
+@app.post("/api/runs/{run_id}/publish")
+def publish_run(
+    run_id: str,
+    request_data: PublishRequest,
+    x_publish_password: str = Header("", alias="X-Publish-Password"),
+):
+    check_run_id(run_id)
+    platforms = list(dict.fromkeys(request_data.platforms))
+    gh_req, dev_req = request_data.github, request_data.devto
+
+    if "github" in platforms and gh_req is None:
+        raise HTTPException(status_code=422, detail="Choose a GitHub account to publish to GitHub Pages.")
+    if "devto" in platforms and dev_req is None:
+        raise HTTPException(status_code=422, detail="Choose a dev.to account to publish to dev.to.")
+
+    uses_default = ("github" in platforms and gh_req.use_default) or ("devto" in platforms and dev_req.use_default)
+    if uses_default:
+        _check_publish_password(x_publish_password)
+
+    github_creds: Optional[GithubCredentials] = None
+    if "github" in platforms:
+        if gh_req.use_default:
+            github_creds = default_github()
+            if github_creds is None:
+                raise HTTPException(status_code=403, detail="No default GitHub account is configured.")
+        else:
+            if not gh_req.token.strip() or not gh_req.repo.strip():
+                raise HTTPException(status_code=422, detail="Enter your GitHub repo and access token.")
+            github_creds = GithubCredentials(
+                token=gh_req.token.strip(),
+                repo=gh_req.repo.strip(),
+                branch=gh_req.branch.strip() or "main",
+                base_url=gh_req.base_url.strip(),
+            )
+
+    devto_creds: Optional[DevtoCredentials] = None
+    if "devto" in platforms:
+        if dev_req.use_default:
+            devto_creds = default_devto()
+            if devto_creds is None:
+                raise HTTPException(status_code=403, detail="No default dev.to account is configured.")
+        else:
+            if not dev_req.api_key.strip():
+                raise HTTPException(status_code=422, detail="Enter your dev.to API key.")
+            devto_creds = DevtoCredentials(api_key=dev_req.api_key.strip())
+
+    run_dir = OUTPUTS_DIR / run_id
+    article_file = run_dir / "blog.md"
+    meta_file = run_dir / "meta.json"
+    if not article_file.is_file():
+        raise HTTPException(status_code=404, detail="Article not found (the server may have restarted).")
+
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+
+    results = publish_article(
+        markdown=article_file.read_text(encoding="utf-8"),
+        seo=meta.get("seo") or {},
+        platforms=platforms,
+        draft=request_data.mode == "draft",
+        github=github_creds,
+        devto=devto_creds,
+        previous=meta.get("published") or {},
+    )
+
+    published = meta.get("published") or {}
+    for platform, result in results.items():
+        if result.get("ok"):
+            published[platform] = {k: v for k, v in result.items() if k != "skipped"}
+    meta["published"] = published
+    try:
+        meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        logger.warning("Could not save publish results for run %s", run_id)
+
+    return {"run_id": run_id, "results": results}
 
 
 @app.get("/api/runs/{run_id}/download")

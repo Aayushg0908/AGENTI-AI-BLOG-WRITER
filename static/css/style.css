@@ -1576,3 +1576,299 @@ textarea.plan-feedback {
 [hidden] {
     display: none !important;
 }
+
+
+/* Publish card */
+.publish-card {
+    margin-top: 20px;
+}
+
+
+.publish-note,
+.publish-hint {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+
+.publish-hint.error {
+    color: var(--danger);
+}
+
+
+.publish-platforms {
+    margin-top: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+
+.publish-platform {
+    padding: 9px 12px;
+
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+
+    font-size: 13px;
+    cursor: pointer;
+}
+
+
+.publish-platform input {
+    accent-color: var(--primary-dark);
+}
+
+
+.publish-platform.unavailable {
+    color: var(--muted);
+    cursor: not-allowed;
+}
+
+
+.publish-platform small {
+    color: var(--muted);
+    font-size: 10px;
+}
+
+
+.publish-controls {
+    margin-top: 14px;
+
+    display: grid;
+    grid-template-columns: 1fr 1.4fr auto;
+    align-items: end;
+    gap: 10px;
+}
+
+
+.publish-results {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+
+.publish-result {
+    padding: 10px 12px;
+
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+
+.publish-result.ok strong {
+    color: var(--primary);
+}
+
+
+.publish-result.failed strong {
+    color: var(--danger);
+}
+
+
+.publish-result a {
+    color: var(--blue);
+}
+
+
+.publish-result small,
+.publish-result span {
+    color: var(--muted);
+}
+
+
+@media (max-width: 680px) {
+    .publish-controls {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+.publish-targets {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 12px;
+}
+
+
+.publish-target {
+    margin: 0;
+    padding: 12px;
+    min-width: 0;
+
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+}
+
+
+.publish-target .publish-platform {
+    align-self: flex-start;
+}
+
+
+.publish-fields {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+
+.publish-fields.single {
+    grid-template-columns: 1fr;
+}
+
+
+.publish-card .toggle-field {
+    margin-top: 6px;
+}
+
+
+.publish-card .publish-controls {
+    grid-template-columns: 1fr auto;
+}
+
+
+@media (max-width: 1000px) {
+    .publish-targets {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+@media (max-width: 680px) {
+    .publish-fields,
+    .publish-card .publish-controls {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+/* Bring-your-own API keys */
+.byok-panel {
+    margin-top: 12px;
+    padding: 10px 12px;
+
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+}
+
+
+.byok-panel summary {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+
+.byok-status {
+    color: var(--muted);
+    font-weight: 400;
+}
+
+
+.byok-status.active {
+    color: var(--primary);
+}
+
+
+.byok-note {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+
+.byok-fields {
+    margin-top: 10px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+
+/* Own vs default publishing account */
+.account-choice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+
+    color: var(--muted);
+    font-size: 12px;
+}
+
+
+.account-choice label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+
+.account-choice input {
+    accent-color: var(--primary-dark);
+}
+
+
+.default-target {
+    margin: 0;
+    color: var(--blue);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+
+.publish-card .publish-controls {
+    grid-template-columns: 1fr 1fr auto;
+}
+
+
+@media (max-width: 680px) {
+    .byok-fields,
+    .publish-card .publish-controls {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+.publish-card .publish-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+}
+
+
+.publish-card .publish-controls .field {
+    flex: 1 1 200px;
+}
