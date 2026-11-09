@@ -2,6 +2,11 @@
 
 AgentWriter-AI turns a single topic prompt into a researched, reviewed, publish-ready technical article. It is a multi-agent LangGraph pipeline with a FastAPI web UI that streams every step live.
 
+**🔗 Live demo:** https://agentwriter-ai-uxry.onrender.com  (free tier — the first load can take ~30–60 s while the server wakes up)
+**📝 Sample published post:** https://aayushg0908.github.io/posts/human-in-the-loop-langgraph-interrupts/
+
+![AgentWriter-AI web UI](docs/screenshot.png)
+
 ## ✨ Features
 
 - **Router** decides whether the topic is evergreen, needs some fresh examples, or is news, and how recent sources must be
