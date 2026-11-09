@@ -7,6 +7,7 @@ router -> (research) -> orchestrator -> human_review (interrupt)
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, TypedDict
 from urllib.parse import urlparse
 
+import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
@@ -374,6 +376,17 @@ def _slugify(text: str, max_length: int = 80) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     slug = slug[:max_length].rstrip("-")
     return slug or "article"
+
+
+def _truncate_words(text: str, limit: int) -> str:
+    """Shorten to at most `limit` characters without cutting a word in half."""
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:-–—") + "…"
 
 
 def _word_count(markdown: str) -> int:
@@ -1079,7 +1092,35 @@ def _clean_mermaid(code: str) -> Optional[str]:
             line for line in text.splitlines()
             if not re.match(r"^\s*(click|classDef|style)\b", line, flags=re.I)
         )
-    return text
+    return _quote_flowchart_labels(text)
+
+
+# Unquoted square-bracket label, e.g. G[interrupt (collect)] -> G["interrupt (collect)"].
+# Skips labels that are already quoted or use another node shape ([( ... )], [[ ... ]], [/ ... /], ...).
+_FLOW_LABEL_RE = re.compile(r'(\b[A-Za-z][\w-]*)\[(?![\"(\[/\\>{])([^\]\"\n]+)\]')
+
+
+def _quote_flowchart_labels(text: str) -> str:
+    """Quote flowchart labels: parentheses or punctuation in unquoted labels break Mermaid."""
+    if not text.split(None, 1)[0].lower().startswith(("flowchart", "graph")):
+        return text
+    return _FLOW_LABEL_RE.sub(lambda m: f'{m.group(1)}["{m.group(2).strip()}"]', text)
+
+
+def _mermaid_renders(code: str) -> Optional[bool]:
+    """Ask mermaid.ink to render the diagram: True = valid, False = syntax error, None = unknown."""
+    if os.getenv("MERMAID_VALIDATE", "1") == "0":
+        return None
+    token = base64.urlsafe_b64encode(code.encode("utf-8")).decode("ascii")
+    try:
+        response = requests.get(f"https://mermaid.ink/img/{token}?type=png", timeout=15)
+    except requests.RequestException:
+        return None
+    if response.status_code == 200:
+        return True
+    if response.status_code == 400:
+        return False
+    return None
 
 
 def _heading_key(text: str) -> str:
@@ -1130,6 +1171,9 @@ def diagrams_node(state: State, config: RunnableConfig) -> dict:
         code = _clean_mermaid(spec.mermaid)
         match = by_key.get(_heading_key(spec.section_title))
         if not code or not match or match[0] in chosen:
+            continue
+        if _mermaid_renders(code) is False:
+            logger.warning("Dropping diagram '%s': Mermaid syntax error", spec.title)
             continue
         chosen[match[0]] = {
             "section_title": match[1],
@@ -1215,8 +1259,8 @@ def seo_node(state: State, config: RunnableConfig) -> dict:
         }
 
     data["slug"] = _slugify(data.get("slug") or plan.blog_title)
-    data["seo_title"] = (data.get("seo_title") or plan.blog_title).strip()[:70]
-    data["meta_description"] = (data.get("meta_description") or "").strip()[:160]
+    data["seo_title"] = _truncate_words(data.get("seo_title") or plan.blog_title, 70)
+    data["meta_description"] = _truncate_words(data.get("meta_description") or "", 160)
     data["tags"] = [_slugify(t, 30) for t in data.get("tags") or [] if t.strip()][:5]
     data["keywords"] = [k.strip() for k in data.get("keywords") or [] if k.strip()][:10]
     return {"seo": data}
