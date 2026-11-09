@@ -300,10 +300,13 @@ def publish_article(
         prev = previous.get(platform) or {}
         return prev if prev.get("ok") and prev.get("account") == accounts[platform] else {}
 
-    # Canonical URL: the public GitHub Pages copy, from this call or an earlier one.
+    # Canonical URL: the public GitHub Pages copy of this article, from this call or an earlier
+    # one. Not tied to the account check: dev.to may be published in a later, separate request
+    # without GitHub credentials, and the article's public URL is still the right canonical.
     canonical: Optional[str] = None
-    if earlier("github").get("mode") == "publish":
-        canonical = earlier("github").get("url")
+    prev_github = previous.get("github") or {}
+    if prev_github.get("ok") and prev_github.get("mode") == "publish":
+        canonical = prev_github.get("url")
 
     for platform in PLATFORMS:
         if platform not in platforms:
