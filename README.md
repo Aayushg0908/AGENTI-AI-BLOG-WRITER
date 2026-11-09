@@ -1,6 +1,6 @@
 # AgentWriter-AI
 
-AgentWriter-AI is an open-source technical blog generation app that turns a single topic prompt into a structured, research-aware article workflow using LangGraph, FastAPI, and Ollama-powered prompting.
+AgentWriter-AI is an open-source technical blog generation app that turns a single topic prompt into a structured, research-aware article workflow using LangGraph, FastAPI, and Groq-powered prompting.
 
 It is designed as a lightweight multi-agent writing pipeline:
 
@@ -55,22 +55,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 4. Start Ollama and pull the model
-
-Make sure Ollama is installed and running locally.
-
-```bash
-ollama list
-ollama pull llama3.1:8b
-```
-
-The workflow expects the Ollama server at:
-
-```text
-http://localhost:11434
-```
-
-### 5. Configure environment variables
+### 4. Configure environment variables
 
 Create a `.env` file in the project root with the required keys:
 
@@ -86,9 +71,9 @@ Notes:
 - `DATABASE_URL` is required for the Postgres checkpointer.
 - `TAVILY_API_KEY` is used for research-backed article generation.
 - `GOOGLE_API_KEY` is used when image generation is enabled.
-- `GROQ_API_KEY` is included in the dependency stack and may be used for alternate model routing flows.
+- `GROQ_API_KEY` is required — the workflow's LLM runs on Groq.
 
-### 6. Run the app
+### 5. Run the app
 
 ```bash
 uvicorn app:app --reload
@@ -152,7 +137,7 @@ This project builds on top of excellent open-source tooling, including:
 - LangGraph
 - LangChain
 - FastAPI
-- Ollama
+- Groq
 - PostgreSQL
 - Tavily
 - Google GenAI
