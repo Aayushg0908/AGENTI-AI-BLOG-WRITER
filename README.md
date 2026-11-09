@@ -1,4 +1,8 @@
-# AgentWriter-AI
+<p align="center">
+  <img src="docs/logo.svg" alt="AgentWriter-AI logo" width="120">
+</p>
+
+<h1 align="center">AgentWriter-AI</h1>
 
 AgentWriter-AI turns a single topic prompt into a researched, reviewed, publish-ready technical article. It is a multi-agent LangGraph pipeline with a FastAPI web UI that streams every step live.
 

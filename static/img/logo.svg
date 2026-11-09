@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="AgentWriter AI logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#83f5b5"/>
+      <stop offset="1" stop-color="#20b76a"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bg)"/>
+  <!-- pen nib -->
+  <path d="M44 30 H80 L92 62 C92 76 76 90 62 112 C48 90 32 76 32 62 Z" transform="translate(2 0)" fill="#07100e"/>
+  <rect x="42" y="22" width="44" height="10" rx="4" fill="#07100e"/>
+  <circle cx="64" cy="64" r="8" fill="url(#bg)"/>
+  <path d="M64 72 V104" stroke="#52d993" stroke-width="5" stroke-linecap="round"/>
+  <!-- AI spark -->
+  <path d="M104 14 L107.5 24.5 L118 28 L107.5 31.5 L104 42 L100.5 31.5 L90 28 L100.5 24.5 Z" fill="#07100e"/>
+</svg>

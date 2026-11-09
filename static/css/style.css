@@ -1872,3 +1872,11 @@ textarea.plan-feedback {
 .publish-card .publish-controls .field {
     flex: 1 1 200px;
 }
+
+/* SVG logo already carries its own background */
+img.brand-logo {
+    display: block;
+    background: none;
+    padding: 0;
+    object-fit: contain;
+}
