@@ -1,38 +1,53 @@
 # AgentWriter-AI
 
-AgentWriter-AI is an open-source technical blog generation app that turns a single topic prompt into a structured, research-aware article workflow using LangGraph, FastAPI, and Groq-powered prompting.
-
-It is designed as a lightweight multi-agent writing pipeline:
-
-- route the topic into a research or closed-book flow
-- plan a blog outline with concrete tasks
-- generate sections in parallel
-- merge the output into a final markdown article
-- optionally generate supporting images for the article
+AgentWriter-AI turns a single topic prompt into a researched, reviewed, publish-ready technical article. It is a multi-agent LangGraph pipeline with a FastAPI web UI that streams every step live.
 
 ## ✨ Features
 
-- Multi-step LangGraph workflow for blog planning and writing
-- FastAPI + Jinja frontend for an interactive web experience
-- Optional research mode using Tavily web search
-- Markdown article generation with section-by-section writers
-- Image placeholder planning and Gemini image generation support
-- PostgreSQL-backed LangGraph checkpointing for resumable execution
+- **Router** decides whether the topic is evergreen, needs some fresh examples, or is news, and how recent sources must be
+- **Research agent** runs Tavily searches in parallel, filters by recency (`day`/`week`/`month`/`year`) and keeps only real URLs returned by search
+- **Planner** builds an outline that follows your chosen **audience, tone and length**
+- **Human-in-the-loop outline approval**: edit, reorder, add or remove sections, or send feedback and regenerate before any writing starts
+- **Parallel section writers** that know the full outline, so they don't repeat each other
+- **Editor / review agent** checks every section (coverage, duplication, citations, code, tone, length) and sends weak sections back for revision
+- **Citation verification** removes any link that doesn't point at a researched source
+- **Mermaid diagram agent** adds up to 3 architecture/flow/sequence diagrams, rendered in the UI
+- **SEO & publishing pack**: SEO title, meta description, slug, keywords, tags, TL;DR and a social post
+- **Configurable LLM provider**: Groq by default (`openai/gpt-oss-120b`), or Ollama / Google Gemini, with retries
+- **PostgreSQL checkpointing** with a connection pool, falling back to in-memory checkpoints when no database is available
 
 ## 🏗️ Architecture
 
-This repository contains two core parts:
+```mermaid
+flowchart LR
+    A["Router"] -->|"needs research"| B["Research"]
+    A -->|"evergreen"| C["Planner"]
+    B --> C
+    C --> D["Outline approval"]
+    D -->|"regenerate"| C
+    D -->|"approve"| E["Section writers"]
+    E --> F["Editor review"]
+    F -->|"revise"| G["Reviser"]
+    G --> H["Merge"]
+    F -->|"ok"| H
+    H --> I["Citation check"]
+    I --> J["Mermaid diagrams"]
+    J --> K["SEO pack"]
+    K --> L["Save"]
+```
 
-- `backend.py` — the LangGraph workflow, schemas, planning logic, research node, worker nodes, and reducer/image pipeline
-- `app.py` — the FastAPI server that serves the UI and streams execution results
+- `backend.py`: the LangGraph workflow: schemas, agents, graph and checkpointer
+- `app.py`: FastAPI server that serves the UI, streams progress over Server-Sent Events and resumes runs after outline approval
+- `templates/`, `static/`: the web UI (Mermaid diagrams are rendered client-side)
+- `notebooks/4_blog_agent_with_image_gen.ipynb`: the original experiment notebook
 
 ## 🚀 Quick Start
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/entbappy/AgentWriter-AI.git
-cd AgentWriter-AI
+git clone https://github.com/Aayushg0908/AGENTI-AI-BLOG-WRITER.git
+cd AGENTI-AI-BLOG-WRITER
 ```
 
 ### 2. Create and activate a virtual environment
@@ -57,21 +72,37 @@ pip install -r requirements.txt
 
 ### 4. Configure environment variables
 
-Create a `.env` file in the project root with the required keys:
+Create a `.env` file in the project root:
 
 ```env
-DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<db>
-TAVILY_API_KEY=your_tavily_key
+# LLM: groq (default), ollama or google
+LLM_PROVIDER=groq
+LLM_MODEL=openai/gpt-oss-120b
 GROQ_API_KEY=your_groq_key
-GOOGLE_API_KEY=your_google_ai_key
+# GOOGLE_API_KEY=your_google_ai_key
+# OLLAMA_BASE_URL=http://localhost:11434
+# OLLAMA_NUM_CTX=16384
+
+# Research
+TAVILY_API_KEY=your_tavily_key
+
+# Optional: persistent checkpoints (in-memory if unset)
+DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<db>
+
+# Optional tuning
+# LLM_RETRIES=3
+# MAX_REVIEW_ROUNDS=1
+# DB_POOL_SIZE=10
 ```
 
-Notes:
-
-- `DATABASE_URL` is required for the Postgres checkpointer.
-- `TAVILY_API_KEY` is used for research-backed article generation.
-- `GOOGLE_API_KEY` is used when image generation is enabled.
-- `GROQ_API_KEY` is required — the workflow's LLM runs on Groq.
+| Variable | Purpose |
+|---|---|
+| `LLM_PROVIDER` / `LLM_MODEL` | Which model to use. Defaults: `groq` + `openai/gpt-oss-120b`, `ollama` + `mistral`, `google` + `gemini-2.5-flash` |
+| `GROQ_API_KEY` | Required for the default Groq provider |
+| `OLLAMA_NUM_CTX` | Only for Ollama: context window. Keep it large; the default silently truncates long prompts |
+| `TAVILY_API_KEY` | Web research |
+| `DATABASE_URL` | Postgres checkpoints. `sslmode=require` is added for remote hosts |
+| `MAX_REVIEW_ROUNDS` | Editor → revise cycles (0 disables revisions) |
 
 ### 5. Run the app
 
@@ -79,52 +110,30 @@ Notes:
 uvicorn app:app --reload
 ```
 
-Then open the local UI in your browser:
-
-```text
-http://127.0.0.1:8000
-```
+Open http://127.0.0.1:8000, enter a topic, pick audience/tone/length, and approve the outline when it appears.
 
 ## 📁 Project Structure
 
 ```text
 .
-├── app.py                 # FastAPI frontend entrypoint
-├── backend.py             # LangGraph workflow and article generation logic
-├── requirements.txt       # Python dependencies
+├── app.py                 # FastAPI server, SSE streaming, resume endpoint
+├── backend.py             # LangGraph agents and graph
+├── requirements.txt
 ├── static/                # CSS/JS frontend assets
-├── templates/             # Jinja HTML templates
-├── notebooks/             # Experiment notebooks
-└── images/                # Generated article visuals
+├── templates/             # Jinja HTML template
+├── notebooks/             # Experiment notebook + sample outputs
+├── docs/                  # Project documentation
+└── outputs/<run_id>/      # Generated blog.md + meta.json (SEO, review, sources)
 ```
 
-## 🧠 How it Works
+## 🔌 API
 
-1. The user provides a topic.
-2. The router decides whether the request is closed-book, hybrid, or open-book.
-3. If research is needed, the workflow queries Tavily and gathers evidence.
-4. The orchestrator creates a structured plan with section goals, bullets, and word targets.
-5. Worker nodes write each section independently in Markdown.
-6. The reducer merges all sections and optionally inserts image placeholders.
-7. The final Markdown is saved and exposed through the app UI.
-
-## 🛠️ Development Notes
-
-- The `backend.py` workflow is intentionally designed to remain the source of truth for the LangGraph graph.
-- The app reads the compiled graph from `backend.app` and exposes it through FastAPI.
-- Generated article outputs are written to the repository root as markdown files.
-- Generated images are stored in the `images/` directory.
-
-## 🤝 Contributing
-
-Contributions are welcome.
-
-If you would like to improve the project:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Open a pull request with a clear description
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/run` | Start a run: `{topic, audience?, tone?, length: short\|medium\|long, require_approval}`. Streams events |
+| `POST` | `/api/runs/{run_id}/resume` | Approve (optionally with an edited plan) or regenerate with feedback: `{action: "approve"\|"regenerate", plan?, feedback?}` |
+| `GET` | `/api/runs/{run_id}/download` | Download the article as `<slug>.md` |
+| `GET` | `/api/health` | Server status, active LLM and checkpointer type |
 
 ## 📄 License
 
@@ -132,12 +141,4 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## 🙌 Acknowledgements
 
-This project builds on top of excellent open-source tooling, including:
-
-- LangGraph
-- LangChain
-- FastAPI
-- Groq
-- PostgreSQL
-- Tavily
-- Google GenAI
+Originally based on [entbappy/AgentWriter-AI](https://github.com/entbappy/AgentWriter-AI). Built with LangGraph, LangChain, FastAPI, Tavily, Mermaid, Ollama, Groq and PostgreSQL.

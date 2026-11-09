@@ -1203,3 +1203,376 @@ textarea::placeholder {
         font-size: 21px;
     }
 }
+
+/* =========================================================
+   Run options, outline approval, review, diagrams, SEO
+   ========================================================= */
+.run-badge.waiting {
+    color: var(--blue);
+}
+
+
+.timeline-item.waiting .timeline-marker span {
+    background: var(--blue);
+    animation: pulse 1.4s infinite;
+}
+
+
+.composer-options {
+    margin-top: 14px;
+
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr auto;
+    align-items: end;
+    gap: 10px;
+}
+
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+
+.field > span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+
+.field input,
+.field select,
+.edit-input {
+    width: 100%;
+    padding: 10px 12px;
+
+    color: var(--text);
+    background: rgba(3, 10, 8, 0.5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+    outline: none;
+
+    font: inherit;
+    font-size: 13px;
+}
+
+
+.field select option {
+    background: var(--surface-solid);
+}
+
+
+.field input:focus,
+.field select:focus,
+.edit-input:focus {
+    border-color: rgba(131, 245, 181, 0.5);
+}
+
+
+.field input::placeholder,
+.edit-input::placeholder {
+    color: #60726c;
+}
+
+
+.toggle-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 0;
+
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+
+.toggle-field input,
+.edit-check input {
+    accent-color: var(--primary-dark);
+}
+
+
+.plan-blog-title {
+    margin: 4px 0 6px;
+    font-family: "Manrope", sans-serif;
+    font-size: 15px;
+}
+
+
+.edit-blog-title {
+    margin: 4px 0 8px;
+    font-family: "Manrope", sans-serif;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+
+.plan-item.editable .plan-content {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+
+textarea.edit-input,
+textarea.plan-feedback {
+    min-height: 0;
+    margin-top: 0;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+
+.edit-title {
+    font-weight: 700;
+}
+
+
+.edit-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+
+    color: var(--muted);
+    font-size: 11px;
+}
+
+
+.edit-row label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+
+.edit-words {
+    width: 84px;
+    padding: 6px 8px;
+}
+
+
+.edit-buttons {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+}
+
+
+.icon-button,
+.copy-chip {
+    padding: 5px 9px;
+
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+
+    font-size: 11px;
+    cursor: pointer;
+}
+
+
+.icon-button:hover,
+.copy-chip:hover {
+    color: var(--text);
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
+
+.icon-button.danger:hover {
+    color: var(--danger);
+}
+
+
+.add-section-button {
+    margin-top: 12px;
+    width: 100%;
+}
+
+
+.plan-review {
+    margin-top: 16px;
+    padding-top: 16px;
+
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+
+    border-top: 1px solid var(--border);
+}
+
+
+.plan-review-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+
+.plan-review-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 9px;
+}
+
+
+.plan-item.revising .plan-status {
+    color: var(--warning);
+}
+
+
+.review-list {
+    margin-top: 10px;
+
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+
+.review-overall {
+    margin: 0 0 6px;
+}
+
+
+.review-list details {
+    margin-top: 6px;
+    padding: 7px 9px;
+
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+
+.review-list summary {
+    color: var(--text);
+    cursor: pointer;
+}
+
+
+.review-list summary span {
+    margin-left: 6px;
+    color: var(--warning);
+}
+
+
+.review-list ul {
+    margin: 6px 0 0;
+    padding-left: 18px;
+}
+
+
+.source-list a small {
+    margin-left: 6px;
+    color: var(--muted);
+}
+
+
+.mermaid-diagram {
+    margin: 22px 0 8px;
+    padding: 18px;
+
+    overflow-x: auto;
+
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-medium);
+
+    text-align: center;
+}
+
+
+.mermaid-diagram svg {
+    max-width: 100%;
+    height: auto;
+}
+
+
+.article-preview pre.mermaid-error {
+    border-color: rgba(255, 126, 140, 0.4);
+}
+
+
+.seo-card {
+    margin-top: 20px;
+}
+
+
+.seo-fields {
+    margin-top: 15px;
+
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+
+.seo-field {
+    padding: 12px;
+
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+}
+
+
+.seo-field-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+
+.seo-field-header span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+
+.seo-field p {
+    margin: 8px 0 0;
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+
+@media (max-width: 1000px) {
+    .composer-options {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+
+@media (max-width: 680px) {
+    .composer-options,
+    .seo-fields {
+        grid-template-columns: 1fr;
+    }
+
+    .toggle-field {
+        white-space: normal;
+    }
+
+    .plan-review-actions {
+        flex-direction: column-reverse;
+        align-items: stretch;
+    }
+}
+
+
+[hidden] {
+    display: none !important;
+}

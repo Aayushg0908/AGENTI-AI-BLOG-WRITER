@@ -1,68 +1,162 @@
+"""
+AgentWriter-AI LangGraph workflow.
+
+router -> (research) -> orchestrator -> human_review (interrupt)
+       -> worker x N -> editor_review <-> reviser
+       -> merge -> citation_check -> diagrams (Mermaid) -> seo -> finalize
+"""
 from __future__ import annotations
 
-import operator
+import json
+import logging
 import os
 import re
-from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TypedDict, List, Optional, Literal, Annotated
+from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
-
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import Send
-
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_community.tools.tavily_search import TavilySearchResults
-
-from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
-import psycopg
-from psycopg.rows import dict_row
-from langgraph.checkpoint.postgres import PostgresSaver
 from dotenv import load_dotenv
-import os 
+from pydantic import BaseModel, Field, ValidationError
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send, interrupt
 
 load_dotenv()
 
+logger = logging.getLogger("agentwriter")
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUTS_DIR = BASE_DIR / "outputs"
+
+LLM_RETRIES = max(1, int(os.getenv("LLM_RETRIES", "3")))
+MAX_REVIEW_ROUNDS = max(0, int(os.getenv("MAX_REVIEW_ROUNDS", "1")))
+MAX_QUERIES = 8
+MAX_EVIDENCE = 16
+MAX_DIAGRAMS = 3
+
+LENGTH_GUIDE = {
+    "short": "4–5 sections, roughly 900–1,200 words in total",
+    "medium": "5–7 sections, roughly 1,500–2,200 words in total",
+    "long": "7–9 sections, roughly 2,500–3,500 words in total",
+}
 
 
-def get_database_url():
-    database_url = os.getenv("DATABASE_URL")
+# =============================================================
+# 1) LLM (provider is configurable through environment variables)
+# =============================================================
+def build_llm():
+    provider = os.getenv("LLM_PROVIDER", "groq").strip().lower()
+    model = os.getenv("LLM_MODEL", "").strip()
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
 
-    if not database_url:
-        raise ValueError(
-            "DATABASE_URL is missing. Please add your Render PostgreSQL External Database URL to .env"
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+
+        if not os.getenv("GROQ_API_KEY"):
+            raise RuntimeError("GROQ_API_KEY is missing. Add it to .env (or set LLM_PROVIDER).")
+
+        return provider, ChatGroq(
+            model=model or "openai/gpt-oss-120b",
+            temperature=temperature,
         )
 
-    if "sslmode=" not in database_url:
-        separator = "&" if "?" in database_url else "?"
-        database_url = f"{database_url}{separator}sslmode=require"
+    if provider in {"google", "gemini"}:
+        from langchain_google_genai import ChatGoogleGenerativeAI
 
-    return database_url
+        return provider, ChatGoogleGenerativeAI(
+            model=model or "gemini-2.5-flash",
+            temperature=temperature,
+        )
+
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return provider, ChatOllama(
+            model=model or "mistral",
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            temperature=temperature,
+            # Ollama's default context window is small and silently
+            # truncates long prompts (evidence packs, full drafts).
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
+        )
+
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER '{provider}'. Use ollama, groq or google."
+    )
 
 
+LLM_PROVIDER, llm = build_llm()
+LLM_DESCRIPTION = f"{LLM_PROVIDER}:{getattr(llm, 'model', None) or getattr(llm, 'model_name', '')}"
 
 
-# -----------------------------
-# 1) Schemas
-# -----------------------------
+def invoke_structured(schema: type[BaseModel], messages: list) -> Any:
+    """Structured-output call with retries (also retries empty results)."""
+    runnable = llm.with_structured_output(schema)
+    last_error: Exception | None = None
+
+    for attempt in range(1, LLM_RETRIES + 1):
+        try:
+            result = runnable.invoke(messages)
+            if result is not None:
+                return result
+            last_error = ValueError("model returned no structured output")
+        except Exception as error:  # noqa: BLE001 - provider errors vary
+            last_error = error
+        logger.warning(
+            "%s attempt %d/%d failed: %s",
+            schema.__name__, attempt, LLM_RETRIES, last_error,
+        )
+
+    raise RuntimeError(
+        f"{schema.__name__} generation failed after {LLM_RETRIES} attempts: {last_error}"
+    )
+
+
+def invoke_text(messages: list) -> str:
+    last_error: Exception | None = None
+
+    for attempt in range(1, LLM_RETRIES + 1):
+        try:
+            content = llm.invoke(messages).content
+            if isinstance(content, list):  # some providers return content blocks
+                content = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            content = str(content).strip()
+            if content:
+                return content
+            last_error = ValueError("model returned empty text")
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+        logger.warning("Text attempt %d/%d failed: %s", attempt, LLM_RETRIES, last_error)
+
+    raise RuntimeError(f"Text generation failed after {LLM_RETRIES} attempts: {last_error}")
+
+
+# =============================================================
+# 2) Schemas
+# =============================================================
 class Task(BaseModel):
     id: int
     title: str
-
     goal: str = Field(
         ...,
         description="One sentence describing what the reader should be able to do/understand after this section.",
     )
     bullets: List[str] = Field(
         ...,
-        min_length=3,
-        max_length=6,
+        min_length=1,
+        max_length=8,
         description="3–6 concrete, non-overlapping subpoints to cover in this section.",
     )
     target_words: int = Field(..., description="Target word count for this section (120–550).")
-
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
@@ -75,78 +169,198 @@ class Plan(BaseModel):
     tone: str
     blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
     constraints: List[str] = Field(default_factory=list)
-    tasks: List[Task]
+    tasks: List[Task] = Field(..., min_length=1)
 
 
 class EvidenceItem(BaseModel):
     title: str
     url: str
-    published_at: Optional[str] = None  # keep if Tavily provides; DO NOT rely on it
+    published_at: Optional[str] = None
     snippet: Optional[str] = None
     source: Optional[str] = None
-
-
-class RouterDecision(BaseModel):
-    needs_research: bool
-    mode: Literal["closed_book", "hybrid", "open_book"]
-    queries: List[str] = Field(default_factory=list)
 
 
 class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-class ImageSpec(BaseModel):
-    placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
-    alt: str
+class RouterDecision(BaseModel):
+    needs_research: bool
+    mode: Literal["closed_book", "hybrid", "open_book"]
+    queries: List[str] = Field(default_factory=list)
+    recency_days: Optional[int] = Field(
+        None,
+        description="Only keep sources published within this many days (null = no limit).",
+    )
+
+
+class SectionReview(BaseModel):
+    task_id: int
+    verdict: Literal["ok", "revise"]
+    issues: List[str] = Field(default_factory=list)
+
+
+class ReviewReport(BaseModel):
+    overall: str = Field(..., description="1–3 sentence assessment of the whole draft.")
+    sections: List[SectionReview] = Field(default_factory=list)
+
+
+class DiagramSpec(BaseModel):
+    section_title: str = Field(..., description="Exact title of the section the diagram belongs to.")
+    title: str
     caption: str
-    prompt: str = Field(..., description="Prompt to send to the image model.")
-    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
-    quality: Literal["low", "medium", "high"] = "medium"
+    mermaid: str = Field(..., description="Mermaid source code, without ``` fences.")
 
 
-class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str
-    images: List[ImageSpec] = Field(default_factory=list)
+class DiagramPlan(BaseModel):
+    diagrams: List[DiagramSpec] = Field(default_factory=list)
 
 
+class SeoPack(BaseModel):
+    seo_title: str = Field(..., description="Search-friendly title, max 60 characters.")
+    meta_description: str = Field(..., description="Meta description, 140–160 characters.")
+    slug: str = Field(..., description="URL slug: lowercase words joined by hyphens.")
+    keywords: List[str] = Field(default_factory=list, description="5–10 search keywords.")
+    tags: List[str] = Field(default_factory=list, description="3–5 platform tags (dev.to/Hashnode style).")
+    summary: str = Field(..., description="2–3 sentence summary / TL;DR.")
+    social_post: str = Field(..., description="Short LinkedIn/X post announcing the article, max 280 characters.")
 
 
-class State(TypedDict):
+# =============================================================
+# 3) State
+# =============================================================
+def merge_sections(left: Optional[Dict[str, str]], right: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Sections keyed by task id; later writes (revisions) replace earlier ones."""
+    merged = dict(left or {})
+    merged.update(right or {})
+    return merged
+
+
+class State(TypedDict, total=False):
+    # user inputs
     topic: str
+    audience: str
+    tone: str
+    length: str
+    require_approval: bool
+    as_of: str
 
     # routing / research
     mode: str
     needs_research: bool
     queries: List[str]
-    evidence: List[EvidenceItem]
-    plan: Optional[Plan]
+    recency_days: Optional[int]
+    evidence: List[dict]
 
-    # workers
-    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
+    # planning + human review
+    plan: Optional[dict]
+    plan_feedback: str
+    plan_approved: bool
 
-    # reducer/image
+    # writing + editing
+    sections: Annotated[Dict[str, str], merge_sections]
+    review: dict
+    review_round: int
+
+    # assembly
     merged_md: str
-    md_with_placeholders: str
-    image_specs: List[dict]
-
+    citation_report: dict
+    diagrams: List[dict]
+    md_with_diagrams: str
+    seo: dict
     final: str
+    output_path: str
 
 
+# =============================================================
+# Helpers
+# =============================================================
+def _today(state: State) -> date:
+    try:
+        return date.fromisoformat(state.get("as_of") or "")
+    except ValueError:
+        return date.today()
 
 
-llm = ChatOllama(
-    model="mistral",
-    base_url="http://localhost:11434",
-    temperature=0,
-)
+def _parse_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        pass
+    try:
+        return parsedate_to_datetime(text).date()
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
+def _normalize_url(url: str) -> str:
+    return (url or "").strip().split("#")[0].rstrip("/").lower()
 
-# -----------------------------
-# 3) Router (decide upfront)
-# -----------------------------
+
+def _slugify(text: str, max_length: int = 80) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    slug = slug[:max_length].rstrip("-")
+    return slug or "article"
+
+
+def _word_count(markdown: str) -> int:
+    without_code = re.sub(r"```.*?```", " ", markdown or "", flags=re.S)
+    return len(re.findall(r"\b\w+\b", without_code))
+
+
+def _plan(state: State) -> Plan:
+    return Plan(**state["plan"])
+
+
+def _evidence_lines(evidence: List[dict], limit: int = 20) -> str:
+    return "\n".join(
+        f"- {e.get('title', '')} | {e.get('url', '')} | {e.get('published_at') or 'date:unknown'}"
+        for e in evidence[:limit]
+    )
+
+
+def normalize_plan(plan: Plan, state: State | dict) -> Plan:
+    """Renumber tasks, clamp word targets and honour user-specified audience/tone."""
+    tasks = []
+    for index, task in enumerate(plan.tasks, start=1):
+        bullets = [b.strip() for b in task.bullets if b and b.strip()] or [task.goal]
+        tasks.append(
+            task.model_copy(
+                update={
+                    "id": index,
+                    "title": task.title.strip() or f"Section {index}",
+                    "bullets": bullets[:8],
+                    "target_words": min(800, max(80, int(task.target_words or 300))),
+                }
+            )
+        )
+
+    update: dict[str, Any] = {"tasks": tasks}
+    if (state.get("audience") or "").strip():
+        update["audience"] = state["audience"].strip()
+    if (state.get("tone") or "").strip():
+        update["tone"] = state["tone"].strip()
+    return plan.model_copy(update=update)
+
+
+def validate_plan(payload: dict, state: dict | None = None) -> dict:
+    """Validate a user-edited plan coming from the UI. Raises ValueError."""
+    try:
+        plan = Plan(**payload)
+    except ValidationError as error:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in error.errors()[:5]
+        )
+        raise ValueError(f"Invalid plan: {problems}") from error
+    return normalize_plan(plan, state or {}).model_dump()
+
+
+# =============================================================
+# 4) Router
+# =============================================================
 ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
 
 Decide whether web research is needed BEFORE planning.
@@ -160,119 +374,201 @@ Modes:
   Mostly volatile: weekly roundups, "this week", "latest", rankings, pricing, policy/regulation.
 
 If needs_research=true:
-- Output 3–10 high-signal queries.
+- Output 3–8 high-signal queries.
 - Queries should be scoped and specific (avoid generic queries like just "AI" or "LLM").
-- If user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES.
+- If the user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES,
+  using the real dates relative to today's date.
+
+recency_days (how fresh sources must be):
+- open_book: required. "today" -> 1, "this week"/"last week" -> 7, "latest"/"this month" -> 30,
+  "this year" -> 365.
+- hybrid: usually 365 (recent tools/models), or null if age does not matter.
+- closed_book: null.
 """
 
+
 def router_node(state: State) -> dict:
-    
-    topic = state["topic"]
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
+    as_of = _today(state).isoformat()
+    decision: RouterDecision = invoke_structured(
+        RouterDecision,
         [
             SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {topic}"),
-        ]
+            HumanMessage(content=f"Today's date: {as_of}\nTopic: {state['topic']}"),
+        ],
     )
 
+    needs_research = decision.needs_research and decision.mode != "closed_book"
+    recency = decision.recency_days if needs_research else None
+    if recency is not None and recency <= 0:
+        recency = None
+    if decision.mode == "open_book" and recency is None:
+        recency = 30
+
     return {
-        "needs_research": decision.needs_research,
-        "mode": decision.mode,
-        "queries": decision.queries,
+        "as_of": as_of,
+        "needs_research": needs_research,
+        "mode": decision.mode if needs_research else "closed_book",
+        "queries": [q.strip() for q in decision.queries if q and q.strip()][:MAX_QUERIES],
+        "recency_days": recency,
     }
 
+
 def route_next(state: State) -> str:
-    return "research" if state["needs_research"] else "orchestrator"
+    return "research" if state.get("needs_research") and state.get("queries") else "orchestrator"
 
 
+# =============================================================
+# 5) Research (Tavily)
+# =============================================================
+def _time_range_for(days: Optional[int]) -> Optional[str]:
+    if not days:
+        return None
+    if days <= 1:
+        return "day"
+    if days <= 7:
+        return "week"
+    if days <= 31:
+        return "month"
+    if days <= 366:
+        return "year"
+    return None
 
 
+def _tavily_search(query: str, *, max_results: int, topic: str, time_range: Optional[str]) -> List[dict]:
+    from langchain_tavily import TavilySearch
 
-# -----------------------------
-# 4) Research (Tavily) 
-# -----------------------------
-def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    
-    tool = TavilySearchResults(max_results=max_results)
-    results = tool.invoke({"query": query})
+    try:
+        tool = TavilySearch(max_results=max_results, topic=topic, time_range=time_range)
+        response = tool.invoke({"query": query})
+    except Exception as error:  # noqa: BLE001 - one failed query should not kill research
+        logger.warning("Tavily query failed (%s): %s", query, error)
+        return []
 
-    normalized: List[dict] = []
-    for r in results or []:
-        normalized.append(
+    if not isinstance(response, dict):
+        return []
+
+    results = []
+    for item in response.get("results") or []:
+        url = (item.get("url") or "").strip()
+        if not url:
+            continue
+        results.append(
             {
-                "title": r.get("title") or "",
-                "url": r.get("url") or "",
-                "snippet": r.get("content") or r.get("snippet") or "",
-                "published_at": r.get("published_date") or r.get("published_at"),
-                "source": r.get("source"),
+                "title": (item.get("title") or "").strip(),
+                "url": url,
+                "snippet": (item.get("content") or "")[:600],
+                "published_at": item.get("published_date") or item.get("published_at"),
+                "source": urlparse(url).netloc,
             }
         )
-    return normalized
+    return results
 
 
 RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
 
-Given raw web search results, produce a deduplicated list of EvidenceItem objects.
+Given raw web search results, select the useful ones as EvidenceItem objects.
 
 Rules:
-- Only include items with a non-empty url.
-- Prefer relevant + authoritative sources (company blogs, docs, reputable outlets).
-- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
-  If missing or unclear, set published_at=null. Do NOT guess.
-- Keep snippets short.
-- Deduplicate by URL.
+- Copy each url EXACTLY as it appears in the input. Never invent or modify URLs.
+- Prefer relevant + authoritative sources (official docs, company/engineering blogs, reputable outlets).
+- Drop results that are off-topic, spammy, or duplicate another result.
+- Keep snippets short (1–2 sentences) and factual.
+- Leave published_at null; dates are filled in from the raw data afterwards.
 """
 
+
 def research_node(state: State) -> dict:
+    queries = (state.get("queries") or [])[:MAX_QUERIES]
+    mode = state.get("mode", "hybrid")
+    recency_days = state.get("recency_days")
+    search_topic = "news" if mode == "open_book" else "general"
+    time_range = _time_range_for(recency_days)
 
-    # take the first 10 queries from state
-    queries = (state.get("queries", []) or [])
-    max_results = 6
-
-    raw_results: List[dict] = []
-
-    for q in queries:
-        raw_results.extend(_tavily_search(q, max_results=max_results))
-
-    if not raw_results:
+    if not queries:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"Raw results:\n{raw_results}"),
-        ]
+    with ThreadPoolExecutor(max_workers=min(4, len(queries))) as pool:
+        batches = list(
+            pool.map(
+                lambda q: _tavily_search(q, max_results=6, topic=search_topic, time_range=time_range),
+                queries,
+            )
+        )
+
+    # Deduplicate by URL and drop results older than the recency window.
+    cutoff = _today(state) - timedelta(days=recency_days) if recency_days else None
+    raw: Dict[str, dict] = {}
+    for batch in batches:
+        for item in batch:
+            key = _normalize_url(item["url"])
+            if key in raw:
+                continue
+            published = _parse_date(item.get("published_at"))
+            item["published_at"] = published.isoformat() if published else None
+            if cutoff and published and published < cutoff:
+                continue
+            raw[key] = item
+
+    if not raw:
+        return {"evidence": []}
+
+    raw_list = list(raw.values())
+    compact = "\n".join(
+        f"- title: {r['title']}\n  url: {r['url']}\n  snippet: {r['snippet'][:400]}"
+        for r in raw_list[:40]
     )
 
-    # Deduplicate by URL
-    dedup = {}
-    for e in pack.evidence:
-        if e.url:
-            dedup[e.url] = e
+    evidence: List[dict] = []
+    try:
+        pack: EvidencePack = invoke_structured(
+            EvidencePack,
+            [
+                SystemMessage(content=RESEARCH_SYSTEM),
+                HumanMessage(content=f"Topic: {state['topic']}\n\nRaw results:\n{compact}"),
+            ],
+        )
+        seen: set[str] = set()
+        for item in pack.evidence:
+            key = _normalize_url(item.url)
+            source = raw.get(key)
+            # Only keep URLs that actually came back from search (no hallucinated links).
+            if not source or key in seen:
+                continue
+            seen.add(key)
+            evidence.append(
+                {
+                    "title": item.title or source["title"],
+                    "url": source["url"],
+                    "published_at": source["published_at"],
+                    "snippet": (item.snippet or source["snippet"])[:400],
+                    "source": source["source"],
+                }
+            )
+    except RuntimeError as error:
+        logger.warning("Evidence synthesis failed, using raw results: %s", error)
 
-    return {"evidence": list(dedup.values())}
+    if not evidence:
+        evidence = [{**r, "snippet": r["snippet"][:400]} for r in raw_list]
+
+    return {"evidence": evidence[:MAX_EVIDENCE]}
 
 
-
-
-
-# -----------------------------
-# 5) Orchestrator (Plan)
-# -----------------------------
+# =============================================================
+# 6) Orchestrator (plan)
+# =============================================================
 ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Your job is to produce a highly actionable outline for a technical blog post.
 
 Hard requirements:
-- Create 5–9 sections (tasks) suitable for the topic and audience.
+- Follow the length guide for the number of sections and total words.
 - Each task must include:
   1) goal (1 sentence)
   2) 3–6 bullets that are concrete, specific, and non-overlapping
-  3) target word count (120–550)
+  3) target word count (120–550); the sum should match the length guide
+- Use the requested audience and tone when provided.
 
 Quality bar:
-- Assume the reader is a developer; use correct terminology.
+- Use correct terminology for the audience.
 - Bullets must be actionable: build/compare/measure/verify/debug.
 - Ensure the overall plan includes at least 2 of these somewhere:
   * minimal code sketch / MWE (set requires_code=True for that section)
@@ -280,6 +576,7 @@ Quality bar:
   * performance/cost considerations
   * security/privacy considerations (if relevant)
   * debugging/observability tips
+- No two sections may cover the same ground.
 
 Grounding rules:
 - Mode closed_book: keep it evergreen; do not depend on evidence.
@@ -289,61 +586,98 @@ Grounding rules:
 - Mode open_book:
   - Set blog_kind = "news_roundup".
   - Every section is about summarizing events + implications.
-  - DO NOT include tutorial/how-to sections unless user explicitly asked for that.
+  - DO NOT include tutorial/how-to sections unless the user explicitly asked for that.
   - If evidence is empty or insufficient, create a plan that transparently says "insufficient sources"
     and includes only what can be supported.
+
+If reviewer feedback on a previous outline is provided, address ALL of it.
 
 Output must strictly match the Plan schema.
 """
 
+
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
-
-    evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
+    length = state.get("length") or "medium"
+    feedback = (state.get("plan_feedback") or "").strip()
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence][:16]}"
-                )
-            ),
-        ]
-    )
-
-    return {"plan": plan}
-
-# -----------------------------
-# 6) Fanout
-# -----------------------------
-def fanout(state: State):
-    return [
-        Send(
-            "worker",
-            {
-                "task": task.model_dump(),
-                "topic": state["topic"],
-                "mode": state["mode"],
-                "plan": state["plan"].model_dump(),
-                "evidence": [e.model_dump() for e in state.get("evidence", [])],
-            },
-        )
-        for task in state["plan"].tasks
+    parts = [
+        f"Today's date: {_today(state).isoformat()}",
+        f"Topic: {state['topic']}",
+        f"Mode: {mode}",
+        f"Audience: {state.get('audience') or 'choose the most suitable developer audience'}",
+        f"Tone: {state.get('tone') or 'choose a suitable tone (precise, practical)'}",
+        f"Length guide: {LENGTH_GUIDE.get(length, LENGTH_GUIDE['medium'])}",
+        "",
+        "Evidence (ONLY use for fresh claims; may be empty):",
+        _evidence_lines(state.get("evidence") or [], limit=MAX_EVIDENCE) or "(none)",
     ]
+    if feedback and state.get("plan"):
+        parts += [
+            "",
+            "Previous outline:",
+            json.dumps(state["plan"], ensure_ascii=False)[:6000],
+            "",
+            f"Reviewer feedback on the previous outline: {feedback}",
+        ]
+
+    plan: Plan = invoke_structured(
+        Plan,
+        [SystemMessage(content=ORCH_SYSTEM), HumanMessage(content="\n".join(parts))],
+    )
+    if mode == "open_book":
+        plan = plan.model_copy(update={"blog_kind": "news_roundup"})
+
+    return {
+        "plan": normalize_plan(plan, state).model_dump(),
+        "plan_feedback": "",
+        "plan_approved": False,
+    }
 
 
+# =============================================================
+# 7) Human review of the outline (LangGraph interrupt)
+# =============================================================
+def human_review_node(state: State) -> dict:
+    if not state.get("require_approval"):
+        return {"plan_approved": True}
+
+    decision = interrupt({"type": "plan_review", "plan": state["plan"]})
+    if not isinstance(decision, dict):
+        decision = {}
+
+    if decision.get("action") == "regenerate":
+        feedback = str(decision.get("feedback") or "").strip() or "Improve the outline."
+        return {"plan_approved": False, "plan_feedback": feedback[:2000]}
+
+    plan = state["plan"]
+    if decision.get("plan"):
+        plan = validate_plan(decision["plan"], state)
+    return {"plan": plan, "plan_approved": True}
 
 
+def _worker_payload(state: State, task: dict) -> dict:
+    plan = state["plan"]
+    return {
+        "task": task,
+        "topic": state["topic"],
+        "mode": state.get("mode", "closed_book"),
+        "as_of": _today(state).isoformat(),
+        "plan": plan,
+        "outline": [f"{t['id']}. {t['title']}" for t in plan["tasks"]],
+        "evidence": state.get("evidence") or [],
+    }
 
 
-# -----------------------------
-# 7) Worker (write one section)
-# -----------------------------
+def after_review(state: State):
+    if not state.get("plan_approved"):
+        return "orchestrator"
+    return [Send("worker", _worker_payload(state, task)) for task in state["plan"]["tasks"]]
+
+
+# =============================================================
+# 8) Worker / reviser (write one section)
+# =============================================================
 WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
 Write ONE section of a technical blog post in Markdown.
 
@@ -352,6 +686,7 @@ Hard constraints:
 - Stay close to Target words (±15%).
 - Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
 - Start with a '## <Section Title>' heading.
+- Do not repeat material that belongs to the other sections in the outline.
 
 Scope guard:
 - If blog_kind == "news_roundup": do NOT turn this into a tutorial/how-to guide.
@@ -365,6 +700,7 @@ Grounding policy:
   - Only use URLs provided in Evidence. If not supported, write: "Not found in provided sources."
 - If requires_citations == true:
   - For outside-world claims, cite Evidence URLs the same way.
+- Never invent URLs. Links that are not in Evidence will be removed.
 - Evergreen reasoning is OK without citations unless requires_citations is true.
 
 Code:
@@ -375,255 +711,523 @@ Style:
 - Avoid fluff/marketing. Be precise and implementation-oriented.
 """
 
-def worker_node(payload: dict) -> dict:
-    
+
+def _clean_section(markdown: str, title: str) -> str:
+    text = markdown.strip()
+    fenced = re.fullmatch(r"```(?:markdown|md)?\s*\n(.*)\n```", text, flags=re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    text = re.sub(r"^# [^\n]*\n+", "", text)  # drop any stray H1
+    if not text.startswith("## "):
+        text = f"## {title}\n\n{text}"
+    return text
+
+
+def _write_section(payload: dict, *, issues: Optional[List[str]] = None, previous_draft: str = "") -> str:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
-    evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
-    topic = payload["topic"]
-    mode = payload.get("mode", "closed_book")
-
+    evidence = payload.get("evidence") or []
     bullets_text = "\n- " + "\n- ".join(task.bullets)
 
-    evidence_text = ""
-    if evidence:
-        evidence_text = "\n".join(
-            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}".strip()
-            for e in evidence[:20]
-        )
-
-    section_md = llm.invoke(
-        [
-            SystemMessage(content=WORKER_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog title: {plan.blog_title}\n"
-                    f"Audience: {plan.audience}\n"
-                    f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {topic}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Section title: {task.title}\n"
-                    f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY use these URLs when citing):\n{evidence_text}\n"
-                )
-            ),
-        ]
-    ).content.strip()
-
-    return {"sections": [(task.id, section_md)]}
-
-
-
-
-
-
-# ============================================================
-# 8) ReducerWithImages (subgraph)
-#    merge_content -> decide_images -> generate_and_place_images
-# ============================================================
-def merge_content(state: State) -> dict:
-
-    plan = state["plan"]
-
-    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
-    body = "\n\n".join(ordered_sections).strip()
-    merged_md = f"# {plan.blog_title}\n\n{body}\n"
-    return {"merged_md": merged_md}
-
-
-DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
-Decide if images/diagrams are needed for THIS blog.
-
-Rules:
-- Max 3 images total.
-- Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
-- Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
-"""
-
-def decide_images(state: State) -> dict:
-    
-    planner = llm.with_structured_output(GlobalImagePlan)
-    merged_md = state["merged_md"]
-    plan = state["plan"]
-    assert plan is not None
-
-    image_plan = planner.invoke(
-        [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
-                )
-            ),
-        ]
+    content = (
+        f"Today's date: {payload.get('as_of')}\n"
+        f"Blog title: {plan.blog_title}\n"
+        f"Audience: {plan.audience}\n"
+        f"Tone: {plan.tone}\n"
+        f"Blog kind: {plan.blog_kind}\n"
+        f"Constraints: {plan.constraints}\n"
+        f"Topic: {payload['topic']}\n"
+        f"Mode: {payload.get('mode', 'closed_book')}\n\n"
+        f"Full outline (you write only section {task.id}):\n" + "\n".join(payload.get("outline") or []) + "\n\n"
+        f"Section title: {task.title}\n"
+        f"Goal: {task.goal}\n"
+        f"Target words: {task.target_words}\n"
+        f"Tags: {task.tags}\n"
+        f"requires_research: {task.requires_research}\n"
+        f"requires_citations: {task.requires_citations}\n"
+        f"requires_code: {task.requires_code}\n"
+        f"Bullets:{bullets_text}\n\n"
+        f"Evidence (ONLY use these URLs when citing):\n{_evidence_lines(evidence) or '(none)'}\n"
     )
 
+    if issues:
+        content += (
+            "\n\nYou are REVISING your previous draft of this section. The editor flagged these issues; "
+            "fix every one of them while keeping what already works:\n- "
+            + "\n- ".join(issues)
+            + f"\n\nPrevious draft:\n{previous_draft}\n"
+        )
+
+    raw = invoke_text([SystemMessage(content=WORKER_SYSTEM), HumanMessage(content=content)])
+    return _clean_section(raw, task.title)
+
+
+def worker_node(payload: dict) -> dict:
+    task_id = str(payload["task"]["id"])
+    return {"sections": {task_id: _write_section(payload)}}
+
+
+def reviser_node(payload: dict) -> dict:
+    task_id = str(payload["task"]["id"])
+    revised = _write_section(
+        payload,
+        issues=payload.get("issues") or [],
+        previous_draft=payload.get("previous_draft") or "",
+    )
+    return {"sections": {task_id: revised}}
+
+
+# =============================================================
+# 9) Editor / review agent
+# =============================================================
+EDITOR_SYSTEM = """You are the editor-in-chief reviewing a draft technical blog post, section by section.
+
+For EVERY section return a verdict:
+- "ok": publishable as-is (minor nitpicks do not count).
+- "revise": has a material problem, e.g.
+  * does not cover its planned bullets or drifts from its goal
+  * repeats content that another section already covers
+  * claims about recent events/products without a citation where citations are required
+  * incorrect, incomplete or non-runnable code; wrong terminology
+  * fluff, marketing language, or a tone that does not fit the audience
+  * an abrupt start/end that breaks the flow of the article
+
+Issues must be specific and actionable (what to change and where). Max 5 issues per section.
+Return "overall" as a 1–3 sentence assessment of the whole draft.
+"""
+
+
+def _rule_based_issues(task: Task, markdown: str) -> List[str]:
+    issues = []
+    words = _word_count(markdown)
+    if not markdown.strip():
+        issues.append("Section is missing; write it.")
+    elif words < task.target_words * 0.6:
+        issues.append(f"Too short: {words} words vs target {task.target_words}. Expand the thinnest bullets.")
+    elif words > task.target_words * 1.6:
+        issues.append(f"Too long: {words} words vs target {task.target_words}. Tighten it.")
+    if task.requires_code and "```" not in markdown:
+        issues.append("Section requires a minimal code example but has none.")
+    return issues
+
+
+def editor_review_node(state: State) -> dict:
+    plan = _plan(state)
+    sections = state.get("sections") or {}
+    review_round = (state.get("review_round") or 0) + 1
+
+    blocks = []
+    for task in plan.tasks:
+        md = sections.get(str(task.id), "")
+        blocks.append(
+            f"<section id=\"{task.id}\" title=\"{task.title}\" target_words=\"{task.target_words}\" "
+            f"actual_words=\"{_word_count(md)}\" requires_citations=\"{task.requires_citations}\" "
+            f"requires_code=\"{task.requires_code}\">\n"
+            f"Goal: {task.goal}\nPlanned bullets: {task.bullets}\n---\n{md}\n</section>"
+        )
+
+    try:
+        report: ReviewReport = invoke_structured(
+            ReviewReport,
+            [
+                SystemMessage(content=EDITOR_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Blog title: {plan.blog_title}\nAudience: {plan.audience}\nTone: {plan.tone}\n"
+                        f"Blog kind: {plan.blog_kind}\nMode: {state.get('mode', 'closed_book')}\n\n"
+                        + "\n\n".join(blocks)
+                    )
+                ),
+            ],
+        )
+    except RuntimeError as error:
+        logger.warning("Editor review failed, using rule-based checks only: %s", error)
+        report = ReviewReport(overall="Automated editorial review unavailable; applied rule-based checks.")
+
+    llm_reviews = {r.task_id: r for r in report.sections}
+    results = []
+    for task in plan.tasks:
+        llm_review = llm_reviews.get(task.id)
+        issues = list(llm_review.issues) if llm_review and llm_review.verdict == "revise" else []
+        issues += _rule_based_issues(task, sections.get(str(task.id), ""))
+        results.append(
+            {
+                "task_id": task.id,
+                "title": task.title,
+                "verdict": "revise" if issues else "ok",
+                "issues": issues[:6],
+            }
+        )
+
     return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
+        "review": {"round": review_round, "overall": report.overall, "sections": results},
+        "review_round": review_round,
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
-    from google import genai
-    from google.genai import types
+def after_editor(state: State):
+    review = state.get("review") or {}
+    flagged = [s for s in review.get("sections", []) if s["verdict"] == "revise"]
+    if not flagged or (state.get("review_round") or 0) > MAX_REVIEW_ROUNDS:
+        return "merge"
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+    tasks = {t["id"]: t for t in state["plan"]["tasks"]}
+    sections = state.get("sections") or {}
+    sends = []
+    for item in flagged:
+        task = tasks.get(item["task_id"])
+        if not task:
+            continue
+        payload = _worker_payload(state, task)
+        payload["issues"] = item["issues"]
+        payload["previous_draft"] = sections.get(str(task["id"]), "")
+        sends.append(Send("reviser", payload))
+    return sends or "merge"
 
-    client = genai.Client(api_key=api_key)
 
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
+def after_reviser(state: State) -> str:
+    return "editor_review" if (state.get("review_round") or 0) < MAX_REVIEW_ROUNDS else "merge"
+
+
+# =============================================================
+# 10) Merge + citation verification
+# =============================================================
+def merge_node(state: State) -> dict:
+    plan = _plan(state)
+    sections = state.get("sections") or {}
+    body = "\n\n".join(
+        sections[str(task.id)].strip() for task in plan.tasks if sections.get(str(task.id))
     )
-
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
-
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    return {"merged_md": f"# {plan.blog_title}\n\n{body}\n"}
 
 
-def generate_and_place_images(state: State) -> dict:
-
-    plan = state["plan"]
-    assert plan is not None
-
-    md = state.get("md_with_placeholders") or state["merged_md"]
-    image_specs = state.get("image_specs", []) or []
-
-    # If no images requested, just write merged markdown
-    if not image_specs:
-        filename = f"{plan.blog_title}.md"
-        Path(filename).write_text(md, encoding="utf-8")
-        return {"final": md}
-
-    images_dir = Path("images")
-    images_dir.mkdir(exist_ok=True)
-
-    for spec in image_specs:
-        placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
-
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
-                continue
-
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
-        md = md.replace(placeholder, img_md)
-
-    filename = f"{plan.blog_title}.md"
-    Path(filename).write_text(md, encoding="utf-8")
-    return {"final": md}
+SOURCE_LINK_RE = re.compile(r"\s?\(\s*\[(?:source|sources|ref|\d+)\]\((https?://[^)\s]+)\)\s*\)", re.I)
+LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\((https?://[^)\s]+)\)")
 
 
+def citation_check_node(state: State) -> dict:
+    """Remove links that do not point at a researched source."""
+    allowed = {_normalize_url(e.get("url", "")) for e in state.get("evidence") or []}
+    verified: set[str] = set()
+    removed: List[str] = []
+
+    def check_source(match: re.Match) -> str:
+        url = match.group(1)
+        if _normalize_url(url) in allowed:
+            verified.add(url)
+            return match.group(0)
+        removed.append(url)
+        return ""
+
+    def check_link(match: re.Match) -> str:
+        text, url = match.group(1), match.group(2)
+        if _normalize_url(url) in allowed:
+            verified.add(url)
+            return match.group(0)
+        removed.append(url)
+        return text
+
+    # Leave code blocks untouched (odd segments are inside ``` fences).
+    segments = re.split(r"(```.*?```)", state["merged_md"], flags=re.S)
+    for index in range(0, len(segments), 2):
+        segment = SOURCE_LINK_RE.sub(check_source, segments[index])
+        segments[index] = LINK_RE.sub(check_link, segment)
+
+    return {
+        "merged_md": "".join(segments),
+        "citation_report": {
+            "verified": len(verified),
+            "removed": len(removed),
+            "removed_urls": removed[:20],
+        },
+    }
 
 
-# build reducer subgraph
-reducer_graph = StateGraph(State)
-reducer_graph.add_node("merge_content", merge_content)
-reducer_graph.add_node("decide_images", decide_images)
-reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
-reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "decide_images")
-reducer_graph.add_edge("decide_images", "generate_and_place_images")
-reducer_graph.add_edge("generate_and_place_images", END)
-reducer_subgraph = reducer_graph.compile()
+# =============================================================
+# 11) Diagram agent (Mermaid)
+# =============================================================
+MERMAID_STARTS = (
+    "flowchart", "graph", "sequencediagram", "classdiagram", "statediagram",
+    "erdiagram", "journey", "gantt", "pie", "mindmap", "timeline", "quadrantchart",
+)
 
-reducer_subgraph
+DIAGRAM_SYSTEM = f"""You are a technical illustrator who draws diagrams as Mermaid code.
+
+Propose 0–{MAX_DIAGRAMS} diagrams that materially improve understanding: architecture, data flow,
+request/response sequences, state machines, decision flows, pipelines. Never decorative.
+If the article would not benefit, return an empty list.
+
+For each diagram:
+- section_title: copy EXACTLY one of the provided section titles. The diagram is placed at the end of it.
+  At most one diagram per section.
+- title: short name. caption: one sentence explaining what the reader should notice.
+- mermaid: valid Mermaid source only (no ``` fences). Prefer `flowchart LR`/`flowchart TD`,
+  `sequenceDiagram`, `stateDiagram-v2`, `classDiagram` or `erDiagram`.
+
+Mermaid syntax rules (avoid common breakages):
+- Node IDs are simple alphanumerics (A, B1, apiGateway). Put labels in brackets: A["Label text"].
+- Wrap every label in double quotes; never put double quotes or square brackets inside a label.
+- Edge labels: A -->|"label"| B.
+- Max ~15 nodes, labels of at most 5 words. No styling, classDef or click directives.
+- The diagram must reflect what the article actually says.
+"""
 
 
+def _clean_mermaid(code: str) -> Optional[str]:
+    text = (code or "").strip()
+    text = re.sub(r"^```(?:mermaid)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    first = text.split(None, 1)[0].lower() if text else ""
+    if not first or not first.startswith(MERMAID_STARTS):
+        return None
+    if re.search(r"^\s*(click|classDef|style)\b", text, flags=re.M | re.I):
+        text = "\n".join(
+            line for line in text.splitlines()
+            if not re.match(r"^\s*(click|classDef|style)\b", line, flags=re.I)
+        )
+    return text
 
-# -----------------------------
-# 9) Build main graph
-# -----------------------------
+
+def _heading_key(text: str) -> str:
+    text = re.sub(r"^\s*(\d+[\.\)]\s*)", "", text or "")
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def diagrams_node(state: State) -> dict:
+    md = state["merged_md"]
+    lines = md.split("\n")
+
+    # H2 headings outside code fences.
+    headings: List[tuple[int, str]] = []
+    in_code = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+        elif not in_code and line.startswith("## "):
+            headings.append((index, line[3:].strip()))
+
+    if not headings:
+        return {"md_with_diagrams": md, "diagrams": []}
+
+    try:
+        plan: DiagramPlan = invoke_structured(
+            DiagramPlan,
+            [
+                SystemMessage(content=DIAGRAM_SYSTEM),
+                HumanMessage(
+                    content=(
+                        "Section titles:\n"
+                        + "\n".join(f"- {title}" for _, title in headings)
+                        + f"\n\nArticle:\n{md[:24000]}"
+                    )
+                ),
+            ],
+        )
+    except RuntimeError as error:
+        logger.warning("Diagram planning failed, skipping diagrams: %s", error)
+        return {"md_with_diagrams": md, "diagrams": []}
+
+    by_key = {_heading_key(title): (index, title) for index, title in headings}
+    chosen: Dict[int, dict] = {}
+    for spec in plan.diagrams:
+        if len(chosen) >= MAX_DIAGRAMS:
+            break
+        code = _clean_mermaid(spec.mermaid)
+        match = by_key.get(_heading_key(spec.section_title))
+        if not code or not match or match[0] in chosen:
+            continue
+        chosen[match[0]] = {
+            "section_title": match[1],
+            "title": spec.title.strip(),
+            "caption": spec.caption.strip(),
+            "mermaid": code,
+        }
+
+    # Insert each diagram at the end of its section (before the next H2), bottom-up.
+    heading_lines = [index for index, _ in headings]
+    ordered = sorted(chosen.items())
+    for figure_number, (_, spec) in enumerate(ordered, start=1):
+        spec["figure"] = figure_number
+
+    for heading_index, spec in reversed(ordered):
+        position = heading_lines.index(heading_index)
+        end = heading_lines[position + 1] if position + 1 < len(heading_lines) else len(lines)
+        while end > heading_index + 1 and not lines[end - 1].strip():
+            end -= 1
+        block = [
+            "",
+            "```mermaid",
+            spec["mermaid"],
+            "```",
+            "",
+            f"*Figure {spec['figure']}: {spec['caption'] or spec['title']}*",
+        ]
+        lines[end:end] = block
+
+    return {
+        "md_with_diagrams": "\n".join(lines),
+        "diagrams": [spec for _, spec in ordered],
+    }
+
+
+# =============================================================
+# 12) SEO / publishing agent
+# =============================================================
+SEO_SYSTEM = """You are an SEO editor preparing a technical article for publishing on a blog,
+dev.to, Hashnode and Medium.
+
+Produce:
+- seo_title: compelling, specific, max 60 characters.
+- meta_description: 140–160 characters, states the concrete benefit to the reader.
+- slug: lowercase, hyphen-separated, 3–8 words, no stop-word padding.
+- keywords: 5–10 realistic search phrases.
+- tags: 3–5 single-word or hyphenated lowercase tags.
+- summary: 2–3 sentence TL;DR.
+- social_post: max 280 characters, no hashtag spam (max 2), no emojis overload.
+Do not promise anything the article does not deliver.
+"""
+
+
+def seo_node(state: State) -> dict:
+    plan = _plan(state)
+    md = state.get("md_with_diagrams") or state["merged_md"]
+
+    try:
+        seo: SeoPack = invoke_structured(
+            SeoPack,
+            [
+                SystemMessage(content=SEO_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Topic: {state['topic']}\nAudience: {plan.audience}\n"
+                        f"Title: {plan.blog_title}\n\nArticle:\n{md[:12000]}"
+                    )
+                ),
+            ],
+        )
+        data = seo.model_dump()
+    except RuntimeError as error:
+        logger.warning("SEO generation failed, using fallback: %s", error)
+        data = {
+            "seo_title": plan.blog_title,
+            "meta_description": plan.tasks[0].goal if plan.tasks else plan.blog_title,
+            "slug": plan.blog_title,
+            "keywords": [],
+            "tags": [],
+            "summary": "",
+            "social_post": "",
+        }
+
+    data["slug"] = _slugify(data.get("slug") or plan.blog_title)
+    data["seo_title"] = (data.get("seo_title") or plan.blog_title).strip()[:70]
+    data["meta_description"] = (data.get("meta_description") or "").strip()[:160]
+    data["tags"] = [_slugify(t, 30) for t in data.get("tags") or [] if t.strip()][:5]
+    data["keywords"] = [k.strip() for k in data.get("keywords") or [] if k.strip()][:10]
+    return {"seo": data}
+
+
+# =============================================================
+# 13) Finalize: write outputs/<run_id>/
+# =============================================================
+def finalize_node(state: State, config: RunnableConfig) -> dict:
+    md = state.get("md_with_diagrams") or state["merged_md"]
+    run_id = str((config.get("configurable") or {}).get("thread_id") or "local")
+    run_id = re.sub(r"[^A-Za-z0-9_-]", "", run_id) or "local"
+
+    run_dir = OUTPUTS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "blog.md").write_text(md, encoding="utf-8")
+    (run_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "topic": state.get("topic"),
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "mode": state.get("mode"),
+                "seo": state.get("seo") or {},
+                "review": state.get("review") or {},
+                "citations": state.get("citation_report") or {},
+                "diagrams": state.get("diagrams") or [],
+                "sources": state.get("evidence") or [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {"final": md, "output_path": str(run_dir / "blog.md")}
+
+
+# =============================================================
+# 14) Graph
+# =============================================================
 g = StateGraph(State)
 g.add_node("router", router_node)
 g.add_node("research", research_node)
 g.add_node("orchestrator", orchestrator_node)
+g.add_node("human_review", human_review_node)
 g.add_node("worker", worker_node)
-g.add_node("reducer", reducer_subgraph)
+g.add_node("editor_review", editor_review_node)
+g.add_node("reviser", reviser_node)
+g.add_node("merge", merge_node)
+g.add_node("citation_check", citation_check_node)
+g.add_node("diagrams", diagrams_node)
+g.add_node("seo", seo_node)
+g.add_node("finalize", finalize_node)
 
 g.add_edge(START, "router")
 g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
 g.add_edge("research", "orchestrator")
-
-g.add_conditional_edges("orchestrator", fanout, ["worker"])
-g.add_edge("worker", "reducer")
-g.add_edge("reducer", END)
-
-
-
-# =========================
-# PostgreSQL Checkpointer
-# =========================
-DATABASE_URL = get_database_url()
-
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row
-)
-
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
+g.add_edge("orchestrator", "human_review")
+g.add_conditional_edges("human_review", after_review, ["orchestrator", "worker"])
+g.add_edge("worker", "editor_review")
+g.add_conditional_edges("editor_review", after_editor, ["reviser", "merge"])
+g.add_conditional_edges("reviser", after_reviser, ["editor_review", "merge"])
+g.add_edge("merge", "citation_check")
+g.add_edge("citation_check", "diagrams")
+g.add_edge("diagrams", "seo")
+g.add_edge("seo", "finalize")
+g.add_edge("finalize", END)
 
 
+# =============================================================
+# 15) Checkpointer: pooled Postgres, or in-memory fallback
+# =============================================================
+def _database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        return ""
+    host = urlparse(url).hostname or ""
+    if "sslmode=" not in url and host not in {"localhost", "127.0.0.1", "::1"}:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
 
+
+def build_checkpointer():
+    url = _database_url()
+    if not url:
+        logger.warning("DATABASE_URL not set; using in-memory checkpoints (lost on restart).")
+        return "memory", InMemorySaver()
+
+    try:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+        from langgraph.checkpoint.postgres import PostgresSaver
+
+        pool = ConnectionPool(
+            conninfo=url,
+            min_size=1,
+            max_size=int(os.getenv("DB_POOL_SIZE", "10")),
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            open=True,
+        )
+        pool.wait(timeout=15)
+        saver = PostgresSaver(pool)
+        saver.setup()
+        return "postgres", saver
+    except Exception as error:  # noqa: BLE001
+        logger.error("Postgres checkpointer unavailable (%s); using in-memory checkpoints.", error)
+        return "memory", InMemorySaver()
+
+
+CHECKPOINTER_KIND, checkpointer = build_checkpointer()
 app = g.compile(checkpointer=checkpointer)
-app

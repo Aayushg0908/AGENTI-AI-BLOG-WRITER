@@ -76,7 +76,7 @@
 
                 <div class="workflow-item">
                     <span>03</span>
-                    Create plan
+                    Plan &amp; approve outline
                 </div>
 
                 <div class="workflow-item">
@@ -86,7 +86,22 @@
 
                 <div class="workflow-item">
                     <span>05</span>
-                    Generate visuals
+                    Editorial review
+                </div>
+
+                <div class="workflow-item">
+                    <span>06</span>
+                    Verify citations
+                </div>
+
+                <div class="workflow-item">
+                    <span>07</span>
+                    Mermaid diagrams
+                </div>
+
+                <div class="workflow-item">
+                    <span>08</span>
+                    SEO pack
                 </div>
             </div>
 
@@ -153,6 +168,44 @@
                         required
                         placeholder="Example: Build a production-ready RAG system with LangGraph, PostgreSQL and observability"
                     ></textarea>
+
+                    <div class="composer-options">
+                        <label class="field">
+                            <span>Audience</span>
+                            <input
+                                id="audienceInput"
+                                type="text"
+                                maxlength="200"
+                                placeholder="Auto, e.g. backend engineers new to LLMs"
+                            >
+                        </label>
+
+                        <label class="field">
+                            <span>Tone</span>
+                            <select id="toneInput">
+                                <option value="">Auto</option>
+                                <option>Practical and direct</option>
+                                <option>Conversational</option>
+                                <option>Beginner-friendly</option>
+                                <option>Formal and in-depth</option>
+                                <option>Opinionated</option>
+                            </select>
+                        </label>
+
+                        <label class="field">
+                            <span>Length</span>
+                            <select id="lengthInput">
+                                <option value="short">Short (~1,000 words)</option>
+                                <option value="medium" selected>Medium (~2,000 words)</option>
+                                <option value="long">Long (~3,000 words)</option>
+                            </select>
+                        </label>
+
+                        <label class="toggle-field">
+                            <input id="approvalInput" type="checkbox" checked>
+                            <span>Review outline before writing</span>
+                        </label>
+                    </div>
 
                     <div class="composer-footer">
                         <div class="examples">
@@ -285,6 +338,44 @@
                             </p>
                         </div>
                     </div>
+
+                    <div
+                        id="planReview"
+                        class="plan-review"
+                        hidden
+                    >
+                        <p class="plan-review-note">
+                            Edit titles, goals, bullets or word targets, then approve.
+                            Or describe what to change and regenerate.
+                        </p>
+
+                        <textarea
+                            id="planFeedback"
+                            class="plan-feedback"
+                            rows="2"
+                            maxlength="2000"
+                            placeholder="Feedback for a new outline, e.g. add a section on cost, drop the history part"
+                        ></textarea>
+
+                        <div class="plan-review-actions">
+                            <button
+                                id="regenerateButton"
+                                class="secondary-button"
+                                type="button"
+                            >
+                                Regenerate outline
+                            </button>
+
+                            <button
+                                id="approveButton"
+                                class="run-button"
+                                type="button"
+                            >
+                                <span>Approve &amp; write</span>
+                                <span>➜</span>
+                            </button>
+                        </div>
+                    </div>
                 </article>
             </section>
 
@@ -368,6 +459,27 @@
                     ></pre>
                 </div>
             </section>
+
+            <section
+                id="seoCard"
+                class="panel-card seo-card"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <span class="panel-label">
+                            Publishing
+                        </span>
+
+                        <h2>SEO &amp; publishing pack</h2>
+                    </div>
+                </div>
+
+                <div
+                    id="seoFields"
+                    class="seo-fields"
+                ></div>
+            </section>
         </main>
     </div>
 
@@ -381,6 +493,8 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
     <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
 
     <script
         src="{{ url_for('static', path='js/app.js') }}"

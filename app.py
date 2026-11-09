@@ -2,822 +2,357 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
+from datetime import date
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Generator, Literal, Optional
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from langgraph.types import Command
 from pydantic import BaseModel, Field
-import uvicorn
-# ---------------------------------------------------------
-# Import the existing compiled LangGraph workflow.
-#
-# backend.py remains completely unchanged.
-# backend.app is the compiled LangGraph workflow.
-# ---------------------------------------------------------
-from backend import app as workflow
 
+from backend import (
+    CHECKPOINTER_KIND,
+    LLM_DESCRIPTION,
+    MAX_REVIEW_ROUNDS,
+    OUTPUTS_DIR,
+    app as workflow,
+    validate_plan,
+)
 
 # ---------------------------------------------------------
-# Paths
+# Paths / logging
 # ---------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
-IMAGES_DIR = BASE_DIR / "images"
-OUTPUTS_DIR = BASE_DIR / "outputs"
-
-TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("langgraph-fastapi")
 
-
-# ---------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------
 app = FastAPI(
-    title="LangGraph Blog Agent",
-    description="FastAPI frontend for the existing LangGraph workflow.",
-    version="1.0.0",
+    title="AgentWriter AI",
+    description="FastAPI frontend for the AgentWriter LangGraph workflow.",
+    version="2.0.0",
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+STAGE_LABELS = {
+    "router": "Analyze the request",
+    "research": "Research sources",
+    "orchestrator": "Create the article plan",
+    "human_review": "Review the outline",
+    "workers": "Write the sections",
+    "editor": "Editorial review",
+    "assemble": "Assemble & verify citations",
+    "diagrams": "Draw Mermaid diagrams",
+    "seo": "SEO & publishing pack",
+    "finalize": "Save the article",
+}
 
 
 # ---------------------------------------------------------
-# Static files
-# ---------------------------------------------------------
-app.mount(
-    "/static",
-    StaticFiles(directory=STATIC_DIR),
-    name="static",
-)
-
-# backend.py saves generated images inside images/
-app.mount(
-    "/images",
-    StaticFiles(directory=IMAGES_DIR),
-    name="images",
-)
-
-
-# ---------------------------------------------------------
-# Templates
-# ---------------------------------------------------------
-templates = Jinja2Templates(
-    directory=TEMPLATES_DIR,
-)
-
-
-# ---------------------------------------------------------
-# Request schema
+# Request schemas
 # ---------------------------------------------------------
 class AgentRunRequest(BaseModel):
-    topic: str = Field(
-        ...,
-        min_length=3,
-        max_length=1000,
-        description="The technical blog topic.",
-    )
+    topic: str = Field(..., min_length=3, max_length=1000)
+    audience: str = Field("", max_length=200)
+    tone: str = Field("", max_length=100)
+    length: Literal["short", "medium", "long"] = "medium"
+    require_approval: bool = True
+
+
+class ResumeRequest(BaseModel):
+    action: Literal["approve", "regenerate"] = "approve"
+    plan: Optional[dict] = None
+    feedback: str = Field("", max_length=2000)
 
 
 # ---------------------------------------------------------
-# Serialization helpers
+# Helpers
 # ---------------------------------------------------------
 def make_serializable(value: Any) -> Any:
-    """
-    Recursively convert Pydantic models and other values
-    into JSON-compatible Python values.
-    """
-
     if hasattr(value, "model_dump"):
         return make_serializable(value.model_dump())
-
-    if hasattr(value, "dict"):
-        return make_serializable(value.dict())
-
     if isinstance(value, dict):
-        return {
-            str(key): make_serializable(item)
-            for key, item in value.items()
-        }
-
+        return {str(k): make_serializable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [
-            make_serializable(item)
-            for item in value
-        ]
-
+        return [make_serializable(v) for v in value]
     return value
 
 
-def create_sse_event(
-    payload: dict[str, Any],
-    event_name: str | None = None,
-) -> str:
-    """
-    Convert a dictionary to a Server-Sent Event message.
-    """
-
-    encoded_payload = json.dumps(
-        jsonable_encoder(payload),
-        ensure_ascii=False,
-    )
-
-    lines: list[str] = []
-
-    if event_name:
-        lines.append(f"event: {event_name}")
-
-    lines.append(f"data: {encoded_payload}")
-
-    return "\n".join(lines) + "\n\n"
+def sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(jsonable_encoder(payload), ensure_ascii=False)}\n\n"
 
 
-def normalize_stream_chunk(
-    chunk: Any,
-) -> tuple[tuple[str, ...], dict[str, Any]]:
-    """
-    Normalize LangGraph streaming chunks.
-
-    With subgraphs=True, LangGraph commonly returns:
-
-        (namespace, update)
-
-    Example:
-
-        (
-            ("reducer:<task-id>",),
-            {"merge_content": {...}}
-        )
-
-    Root graph updates may also be returned directly
-    as dictionaries depending on the LangGraph version.
-    """
-
-    if (
-        isinstance(chunk, tuple)
-        and len(chunk) == 2
-        and isinstance(chunk[1], dict)
-    ):
-        raw_namespace = chunk[0] or ()
-
-        namespace = tuple(
-            str(item)
-            for item in raw_namespace
-        )
-
-        return namespace, chunk[1]
-
-    if isinstance(chunk, dict):
-        return (), chunk
-
-    return (), {}
-
-
-def get_plan_task_map(
-    plan: dict[str, Any],
-) -> dict[int, dict[str, Any]]:
-    """
-    Create a task lookup using each task ID.
-    """
-
-    task_map: dict[int, dict[str, Any]] = {}
-
-    tasks = plan.get("tasks", [])
-
-    if not isinstance(tasks, list):
-        return task_map
-
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-
-        try:
-            task_id = int(task["id"])
-        except (KeyError, TypeError, ValueError):
-            continue
-
-        task_map[task_id] = task
-
-    return task_map
-
-
-def save_final_markdown(
-    run_id: str,
-    markdown: str,
-) -> Path:
-    """
-    Save a predictable copy of the generated Markdown.
-
-    This does not change backend.py. The backend can continue
-    saving its original title-based Markdown file.
-    """
-
-    run_directory = OUTPUTS_DIR / run_id
-    run_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    output_file = run_directory / "blog.md"
-
-    output_file.write_text(
-        markdown,
-        encoding="utf-8",
-    )
-
-    return output_file
-
-
-# ---------------------------------------------------------
-# LangGraph streaming
-# ---------------------------------------------------------
-def stream_workflow(
-    topic: str,
-    run_id: str,
-) -> Generator[str, None, None]:
-    """
-    Run the existing LangGraph workflow and stream
-    observable execution updates to the browser.
-
-    This exposes:
-    - node status
-    - routing decision
-    - research queries and source count
-    - structured article plan
-    - completed sections
-    - image-processing status
-    - final Markdown
-
-    It does not expose private model reasoning.
-    """
-
-    config = {
-        "configurable": {
-            "thread_id": run_id,
-        }
-    }
-
-    workflow_input = {
-        "topic": topic,
-        "sections": [],
-    }
-
-    task_map: dict[int, dict[str, Any]] = {}
-    completed_task_ids: set[int] = set()
-
-    final_markdown = ""
-    workers_completed_event_sent = False
-    reducer_started_event_sent = False
-
-    yield create_sse_event(
-        {
-            "type": "run_started",
-            "run_id": run_id,
-            "topic": topic,
-        }
-    )
-
-    yield create_sse_event(
+def stage(stage_id: str, status: str, detail: str = "") -> str:
+    return sse(
         {
             "type": "stage",
-            "id": "router",
-            "label": "Analyze the request",
-            "status": "running",
-            "detail": (
-                "Determining whether the topic requires "
-                "current web research."
-            ),
+            "id": stage_id,
+            "label": STAGE_LABELS.get(stage_id, stage_id),
+            "status": status,
+            "detail": detail,
         }
     )
 
-    try:
-        stream = workflow.stream(
-            workflow_input,
-            config=config,
-            stream_mode="updates",
-            subgraphs=True,
-        )
 
-        for raw_chunk in stream:
-            namespace, updates = normalize_stream_chunk(
-                raw_chunk
-            )
+def task_map_from(plan: Any) -> dict[int, dict]:
+    tasks = (plan or {}).get("tasks", []) if isinstance(plan, dict) else []
+    result = {}
+    for task in tasks:
+        try:
+            result[int(task["id"])] = task
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
 
-            if not updates:
-                continue
 
-            for node_name, raw_node_update in updates.items():
-                node_update = make_serializable(
-                    raw_node_update
-                )
+def check_run_id(run_id: str) -> str:
+    if not RUN_ID_RE.match(run_id):
+        raise HTTPException(status_code=400, detail="Invalid run ID.")
+    return run_id
 
-                if not isinstance(node_update, dict):
-                    node_update = {}
 
-                # =================================================
-                # Router
-                # =================================================
-                if node_name == "router":
-                    mode = str(
-                        node_update.get(
-                            "mode",
-                            "closed_book",
-                        )
-                    )
+def run_config(run_id: str) -> dict:
+    return {"configurable": {"thread_id": run_id}}
 
-                    needs_research = bool(
-                        node_update.get(
-                            "needs_research",
-                            False,
-                        )
-                    )
 
-                    queries = node_update.get(
-                        "queries",
-                        [],
-                    )
+def pending_review(run_id: str) -> Optional[dict]:
+    """Return the interrupt payload if this run is waiting for outline approval."""
+    snapshot = workflow.get_state(run_config(run_id))
+    for task in getattr(snapshot, "tasks", ()) or ():
+        for item in getattr(task, "interrupts", ()) or ():
+            value = getattr(item, "value", None)
+            if isinstance(value, dict) and value.get("type") == "plan_review":
+                return value
+    return None
 
-                    yield create_sse_event(
-                        {
-                            "type": "routing",
-                            "mode": mode,
-                            "needs_research": needs_research,
-                            "queries": queries,
-                        }
-                    )
 
-                    yield create_sse_event(
-                        {
-                            "type": "stage",
-                            "id": "router",
-                            "label": "Analyze the request",
-                            "status": "completed",
-                            "detail": (
-                                f"Selected {mode.replace('_', ' ')} mode."
-                            ),
-                        }
-                    )
+# ---------------------------------------------------------
+# Streaming: translate LangGraph node updates into UI events
+# ---------------------------------------------------------
+class RunContext:
+    def __init__(self, run_id: str, require_approval: bool, plan: Optional[dict] = None):
+        self.run_id = run_id
+        self.require_approval = require_approval
+        self.task_map = task_map_from(plan)
+        self.completed: set[int] = set()
+        self.revising: set[int] = set()
+        self.editor_done = False
+        self.final = ""
+        self.paused = False
 
-                    if needs_research:
-                        yield create_sse_event(
-                            {
-                                "type": "stage",
-                                "id": "research",
-                                "label": "Research authoritative sources",
-                                "status": "running",
-                                "detail": (
-                                    "Searching the web and preparing "
-                                    "a deduplicated evidence pack."
-                                ),
-                            }
-                        )
 
-                    else:
-                        yield create_sse_event(
-                            {
-                                "type": "stage",
-                                "id": "orchestrator",
-                                "label": "Create the article plan",
-                                "status": "running",
-                                "detail": (
-                                    "Creating the article structure, "
-                                    "goals and writing tasks."
-                                ),
-                            }
-                        )
-
-                # =================================================
-                # Research
-                # =================================================
-                elif node_name == "research":
-                    evidence = node_update.get(
-                        "evidence",
-                        [],
-                    )
-
-                    if not isinstance(evidence, list):
-                        evidence = []
-
-                    yield create_sse_event(
-                        {
-                            "type": "research_complete",
-                            "count": len(evidence),
-                            "evidence": evidence[:12],
-                        }
-                    )
-
-                    yield create_sse_event(
-                        {
-                            "type": "stage",
-                            "id": "research",
-                            "label": "Research authoritative sources",
-                            "status": "completed",
-                            "detail": (
-                                f"Prepared {len(evidence)} "
-                                "deduplicated sources."
-                            ),
-                        }
-                    )
-
-                    yield create_sse_event(
-                        {
-                            "type": "stage",
-                            "id": "orchestrator",
-                            "label": "Create the article plan",
-                            "status": "running",
-                            "detail": (
-                                "Creating sections, goals, bullets "
-                                "and target word counts."
-                            ),
-                        }
-                    )
-
-                # =================================================
-                # Orchestrator
-                # =================================================
-                elif node_name == "orchestrator":
-                    plan = node_update.get(
-                        "plan",
-                        {},
-                    )
-
-                    if not isinstance(plan, dict):
-                        plan = {}
-
-                    task_map = get_plan_task_map(plan)
-
-                    yield create_sse_event(
-                        {
-                            "type": "plan",
-                            "plan": plan,
-                        }
-                    )
-
-                    yield create_sse_event(
-                        {
-                            "type": "stage",
-                            "id": "orchestrator",
-                            "label": "Create the article plan",
-                            "status": "completed",
-                            "detail": (
-                                f"Created {len(task_map)} "
-                                "article sections."
-                            ),
-                        }
-                    )
-
-                    yield create_sse_event(
-                        {
-                            "type": "stage",
-                            "id": "workers",
-                            "label": "Write the planned sections",
-                            "status": "running",
-                            "detail": (
-                                "Section workers are writing "
-                                "the article in parallel."
-                            ),
-                        }
-                    )
-
-                # =================================================
-                # Workers
-                # =================================================
-                elif node_name == "worker":
-                    sections = node_update.get(
-                        "sections",
-                        [],
-                    )
-
-                    if not isinstance(sections, list):
-                        sections = []
-
-                    for section in sections:
-                        if not isinstance(
-                            section,
-                            (list, tuple),
-                        ):
-                            continue
-
-                        if len(section) != 2:
-                            continue
-
-                        raw_task_id, section_markdown = section
-
-                        try:
-                            task_id = int(raw_task_id)
-                        except (TypeError, ValueError):
-                            continue
-
-                        # A parallel worker update should be sent once.
-                        if task_id in completed_task_ids:
-                            continue
-
-                        completed_task_ids.add(task_id)
-
-                        task_information = task_map.get(
-                            task_id,
-                            {},
-                        )
-
-                        title = task_information.get(
-                            "title",
-                            f"Section {task_id}",
-                        )
-
-                        yield create_sse_event(
-                            {
-                                "type": "section_complete",
-                                "task_id": task_id,
-                                "title": title,
-                                "markdown": str(section_markdown),
-                                "completed": len(
-                                    completed_task_ids
-                                ),
-                                "total": len(task_map),
-                            }
-                        )
-
-                    if (
-                        task_map
-                        and len(completed_task_ids) >= len(task_map)
-                        and not workers_completed_event_sent
-                    ):
-                        workers_completed_event_sent = True
-
-                        yield create_sse_event(
-                            {
-                                "type": "stage",
-                                "id": "workers",
-                                "label": "Write the planned sections",
-                                "status": "completed",
-                                "detail": (
-                                    f"Completed all "
-                                    f"{len(task_map)} sections."
-                                ),
-                            }
-                        )
-
-                        yield create_sse_event(
-                            {
-                                "type": "stage",
-                                "id": "reducer",
-                                "label": "Assemble the final article",
-                                "status": "running",
-                                "detail": (
-                                    "Merging the sections and "
-                                    "planning useful visuals."
-                                ),
-                            }
-                        )
-
-                        reducer_started_event_sent = True
-
-                # =================================================
-                # Reducer subgraph: merge
-                # =================================================
-                elif node_name == "merge_content":
-                    if not reducer_started_event_sent:
-                        yield create_sse_event(
-                            {
-                                "type": "stage",
-                                "id": "reducer",
-                                "label": "Assemble the final article",
-                                "status": "running",
-                                "detail": (
-                                    "Merging the sections and "
-                                    "planning useful visuals."
-                                ),
-                            }
-                        )
-
-                        reducer_started_event_sent = True
-
-                    yield create_sse_event(
-                        {
-                            "type": "substage",
-                            "id": "merge_content",
-                            "label": "Merged all written sections",
-                            "status": "completed",
-                            "namespace": list(namespace),
-                        }
-                    )
-
-                # =================================================
-                # Reducer subgraph: image plan
-                # =================================================
-                elif node_name == "decide_images":
-                    image_specs = node_update.get(
-                        "image_specs",
-                        [],
-                    )
-
-                    if not isinstance(image_specs, list):
-                        image_specs = []
-
-                    yield create_sse_event(
-                        {
-                            "type": "images_planned",
-                            "count": len(image_specs),
-                            "images": image_specs,
-                        }
-                    )
-
-                    yield create_sse_event(
-                        {
-                            "type": "substage",
-                            "id": "decide_images",
-                            "label": (
-                                f"Planned {len(image_specs)} "
-                                "technical visual"
-                                f"{'' if len(image_specs) == 1 else 's'}"
-                            ),
-                            "status": "completed",
-                            "namespace": list(namespace),
-                        }
-                    )
-
-                # =================================================
-                # Reducer subgraph: image generation and final text
-                # =================================================
-                elif node_name == "generate_and_place_images":
-                    generated_final = node_update.get(
-                        "final"
-                    )
-
-                    if generated_final:
-                        final_markdown = str(
-                            generated_final
-                        )
-
-                    yield create_sse_event(
-                        {
-                            "type": "substage",
-                            "id": "generate_images",
-                            "label": "Generated and placed visuals",
-                            "status": "completed",
-                            "namespace": list(namespace),
-                        }
-                    )
-
-                # =================================================
-                # Root reducer update
-                # =================================================
-                elif node_name == "reducer":
-                    generated_final = node_update.get(
-                        "final"
-                    )
-
-                    if generated_final:
-                        final_markdown = str(
-                            generated_final
-                        )
-
-        # -----------------------------------------------------
-        # Retrieve the final checkpoint when the root reducer
-        # update did not contain the complete final output.
-        # -----------------------------------------------------
-        if not final_markdown:
-            snapshot = workflow.get_state(config)
-
-            state_values = getattr(
-                snapshot,
-                "values",
-                {},
-            )
-
-            if isinstance(state_values, dict):
-                final_markdown = str(
-                    state_values.get(
-                        "final",
-                        "",
-                    )
-                )
-
-        if not final_markdown:
-            raise RuntimeError(
-                "The workflow completed but did not return final Markdown."
-            )
-
-        save_final_markdown(
-            run_id=run_id,
-            markdown=final_markdown,
-        )
-
-        yield create_sse_event(
+def handle_update(node: str, update: dict, ctx: RunContext) -> Generator[str, None, None]:
+    if node == "router":
+        mode = str(update.get("mode", "closed_book"))
+        needs_research = bool(update.get("needs_research"))
+        recency = update.get("recency_days")
+        yield sse(
             {
-                "type": "stage",
-                "id": "reducer",
-                "label": "Assemble the final article",
-                "status": "completed",
-                "detail": "The final Markdown article is ready.",
+                "type": "routing",
+                "mode": mode,
+                "needs_research": needs_research,
+                "queries": update.get("queries", []),
+                "recency_days": recency,
             }
         )
+        window = f" Sources limited to the last {recency} days." if needs_research and recency else ""
+        yield stage("router", "completed", f"Selected {mode.replace('_', ' ')} mode.{window}")
+        if needs_research and update.get("queries"):
+            yield stage("research", "running", "Searching the web in parallel and filtering by recency.")
+        else:
+            yield stage("orchestrator", "running", "Creating sections, goals and word targets.")
 
-        yield create_sse_event(
+    elif node == "research":
+        evidence = update.get("evidence") or []
+        yield sse({"type": "research_complete", "count": len(evidence), "evidence": evidence[:12]})
+        yield stage("research", "completed", f"Kept {len(evidence)} verified sources.")
+        yield stage("orchestrator", "running", "Creating sections, goals and word targets.")
+
+    elif node == "orchestrator":
+        plan = update.get("plan") or {}
+        ctx.task_map = task_map_from(plan)
+        yield sse({"type": "plan", "plan": plan, "editable": False})
+        yield stage("orchestrator", "completed", f"Created {len(ctx.task_map)} sections.")
+        if ctx.require_approval:
+            yield stage("human_review", "running", "Waiting for your approval of the outline.")
+        else:
+            yield stage("workers", "running", "Section writers are working in parallel.")
+
+    elif node == "__interrupt__":
+        for item in update.get("__interrupt__", []):
+            value = item.get("value") if isinstance(item, dict) else None
+            if isinstance(value, dict) and value.get("type") == "plan_review":
+                ctx.paused = True
+                ctx.task_map = task_map_from(value.get("plan"))
+                yield sse({"type": "plan_review", "run_id": ctx.run_id, "plan": value.get("plan")})
+                yield stage("human_review", "waiting", "Edit the outline, then approve it or ask for a new one.")
+
+    elif node == "human_review":
+        if update.get("plan_approved"):
+            plan = update.get("plan")
+            if plan:
+                ctx.task_map = task_map_from(plan)
+                yield sse({"type": "plan", "plan": plan, "editable": False})
+            if ctx.require_approval:
+                yield stage("human_review", "completed", "Outline approved.")
+            yield stage("workers", "running", "Section writers are working in parallel.")
+        else:
+            yield stage("human_review", "completed", "Feedback sent; regenerating the outline.")
+            yield stage("orchestrator", "running", "Rewriting the outline using your feedback.")
+
+    elif node == "worker":
+        for raw_id, markdown in (update.get("sections") or {}).items():
+            try:
+                task_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if task_id in ctx.completed:
+                continue
+            ctx.completed.add(task_id)
+            yield sse(
+                {
+                    "type": "section_complete",
+                    "task_id": task_id,
+                    "title": ctx.task_map.get(task_id, {}).get("title", f"Section {task_id}"),
+                    "markdown": str(markdown),
+                    "completed": len(ctx.completed),
+                    "total": len(ctx.task_map),
+                }
+            )
+        if ctx.task_map and len(ctx.completed) >= len(ctx.task_map):
+            yield stage("workers", "completed", f"Wrote all {len(ctx.task_map)} sections.")
+            yield stage("editor", "running", "The editor is reviewing every section.")
+
+    elif node == "editor_review":
+        review = update.get("review") or {}
+        flagged = [s for s in review.get("sections", []) if s.get("verdict") == "revise"]
+        will_revise = bool(flagged) and int(review.get("round", 1)) <= MAX_REVIEW_ROUNDS
+        yield sse({"type": "review", "review": review, "will_revise": will_revise})
+        if will_revise:
+            ctx.revising = {int(s["task_id"]) for s in flagged}
+            yield stage("editor", "running", f"Round {review.get('round', 1)}: revising {len(flagged)} section(s).")
+        else:
+            ctx.editor_done = True
+            detail = (
+                "All sections approved."
+                if not flagged
+                else f"{len(flagged)} section(s) still have notes; revision budget used."
+            )
+            yield stage("editor", "completed", detail)
+            yield stage("assemble", "running", "Merging sections and checking every link.")
+
+    elif node == "reviser":
+        for raw_id in (update.get("sections") or {}):
+            task_id = int(raw_id)
+            yield sse(
+                {
+                    "type": "section_revised",
+                    "task_id": task_id,
+                    "title": ctx.task_map.get(task_id, {}).get("title", f"Section {task_id}"),
+                }
+            )
+
+    elif node == "merge":
+        if not ctx.editor_done:
+            ctx.editor_done = True
+            yield stage("editor", "completed", f"Revised {len(ctx.revising)} section(s).")
+            yield stage("assemble", "running", "Merging sections and checking every link.")
+
+    elif node == "citation_check":
+        report = update.get("citation_report") or {}
+        yield sse({"type": "citations", "report": report})
+        detail = f"{report.get('verified', 0)} verified link(s)"
+        if report.get("removed"):
+            detail += f", removed {report['removed']} unverifiable link(s)"
+        yield stage("assemble", "completed", detail + ".")
+        yield stage("diagrams", "running", "Deciding where a diagram helps and drawing it in Mermaid.")
+
+    elif node == "diagrams":
+        diagrams = update.get("diagrams") or []
+        yield sse({"type": "diagrams", "count": len(diagrams), "diagrams": diagrams})
+        yield stage(
+            "diagrams",
+            "completed",
+            f"Added {len(diagrams)} diagram{'' if len(diagrams) == 1 else 's'}."
+            if diagrams else "No diagram needed.",
+        )
+        yield stage("seo", "running", "Writing the title, meta description, slug and tags.")
+
+    elif node == "seo":
+        yield sse({"type": "seo", "seo": update.get("seo") or {}})
+        yield stage("seo", "completed", "Publishing pack ready.")
+        yield stage("finalize", "running", "Saving the article.")
+
+    elif node == "finalize":
+        ctx.final = str(update.get("final") or "")
+        yield stage("finalize", "completed", "The final Markdown article is ready.")
+
+
+def stream_run(graph_input: Any, ctx: RunContext) -> Generator[str, None, None]:
+    config = run_config(ctx.run_id)
+    try:
+        for chunk in workflow.stream(graph_input, config=config, stream_mode="updates"):
+            if not isinstance(chunk, dict):
+                continue
+            for node, raw_update in chunk.items():
+                if node == "__interrupt__":
+                    items = raw_update if isinstance(raw_update, (list, tuple)) else [raw_update]
+                    update = {
+                        "__interrupt__": [
+                            {"value": make_serializable(getattr(item, "value", None))} for item in items
+                        ]
+                    }
+                    yield from handle_update(node, update, ctx)
+                    continue
+                update = make_serializable(raw_update)
+                if not isinstance(update, dict):
+                    update = {}
+                yield from handle_update(node, update, ctx)
+
+        if ctx.paused:
+            yield sse({"type": "paused", "run_id": ctx.run_id})
+            return
+
+        if not ctx.final:
+            values = getattr(workflow.get_state(config), "values", {}) or {}
+            ctx.final = str(values.get("final") or "")
+        if not ctx.final:
+            raise RuntimeError("The workflow completed but did not return final Markdown.")
+
+        yield sse(
             {
                 "type": "final",
-                "run_id": run_id,
-                "markdown": final_markdown,
-                "download_url": (
-                    f"/api/runs/{run_id}/download"
-                ),
+                "run_id": ctx.run_id,
+                "markdown": ctx.final,
+                "download_url": f"/api/runs/{ctx.run_id}/download",
             }
         )
-
-        yield create_sse_event(
-            {
-                "type": "done",
-                "run_id": run_id,
-            }
-        )
+        yield sse({"type": "done", "run_id": ctx.run_id})
 
     except GeneratorExit:
-        logger.info(
-            "Browser disconnected from run %s",
-            run_id,
-        )
+        logger.info("Browser disconnected from run %s", ctx.run_id)
         raise
-
-    except Exception as error:
-        logger.exception(
-            "Workflow run %s failed",
-            run_id,
-        )
-
-        yield create_sse_event(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "message": str(error),
-            }
-        )
+    except Exception as error:  # noqa: BLE001
+        logger.exception("Workflow run %s failed", ctx.run_id)
+        yield sse({"type": "error", "run_id": ctx.run_id, "message": str(error)})
 
 
-# ---------------------------------------------------------
-# Page endpoint
-# ---------------------------------------------------------
-@app.get(
-    "/",
-    response_class=HTMLResponse,
-)
-def home(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-        context={
-            "page_title": "LangGraph Agent Writer",
-        },
-    )
-
-
-# ---------------------------------------------------------
-# Health endpoint
-# ---------------------------------------------------------
-@app.get("/api/health")
-def health_check():
-    return {
-        "status": "ok",
-        "workflow": "loaded",
-    }
-
-
-# ---------------------------------------------------------
-# Agent execution endpoint
-# ---------------------------------------------------------
-@app.post("/api/run")
-def run_agent(request_data: AgentRunRequest):
-    topic = request_data.topic.strip()
-
-    if len(topic) < 3:
-        raise HTTPException(
-            status_code=422,
-            detail="Please provide a valid topic.",
-        )
-
-    run_id = uuid.uuid4().hex
-
+def streaming_response(generator: Generator[str, None, None]) -> StreamingResponse:
     return StreamingResponse(
-        stream_workflow(
-            topic=topic,
-            run_id=run_id,
-        ),
+        generator,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -828,49 +363,98 @@ def run_agent(request_data: AgentRunRequest):
 
 
 # ---------------------------------------------------------
-# Markdown download endpoint
+# Routes
 # ---------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={"page_title": "AgentWriter AI"},
+    )
+
+
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "ok",
+        "workflow": "loaded",
+        "llm": LLM_DESCRIPTION,
+        "checkpointer": CHECKPOINTER_KIND,
+    }
+
+
+@app.post("/api/run")
+def run_agent(request_data: AgentRunRequest):
+    topic = request_data.topic.strip()
+    if len(topic) < 3:
+        raise HTTPException(status_code=422, detail="Please provide a valid topic.")
+
+    run_id = uuid.uuid4().hex
+    graph_input = {
+        "topic": topic,
+        "audience": request_data.audience.strip(),
+        "tone": request_data.tone.strip(),
+        "length": request_data.length,
+        "require_approval": request_data.require_approval,
+        "as_of": date.today().isoformat(),
+        "sections": {},
+        "review_round": 0,
+    }
+    ctx = RunContext(run_id, request_data.require_approval)
+
+    def generator():
+        yield sse({"type": "run_started", "run_id": run_id, "topic": topic})
+        yield stage("router", "running", "Deciding whether the topic needs current web research.")
+        yield from stream_run(graph_input, ctx)
+
+    return streaming_response(generator())
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: str, request_data: ResumeRequest):
+    check_run_id(run_id)
+    review = pending_review(run_id)
+    if review is None:
+        raise HTTPException(status_code=409, detail="This run is not waiting for outline approval.")
+
+    payload: dict[str, Any] = {"action": request_data.action}
+    if request_data.action == "regenerate":
+        payload["feedback"] = request_data.feedback.strip()
+    elif request_data.plan is not None:
+        values = getattr(workflow.get_state(run_config(run_id)), "values", {}) or {}
+        try:
+            payload["plan"] = validate_plan(request_data.plan, values)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    plan = payload.get("plan") or review.get("plan")
+    ctx = RunContext(run_id, require_approval=True, plan=plan)
+
+    def generator():
+        yield sse({"type": "run_resumed", "run_id": run_id, "action": request_data.action})
+        yield from stream_run(Command(resume=payload), ctx)
+
+    return streaming_response(generator())
+
+
 @app.get("/api/runs/{run_id}/download")
 def download_markdown(run_id: str):
-    # Only allow safe run ID characters.
-    safe_run_id = "".join(
-        character
-        for character in run_id
-        if character.isalnum()
-        or character in {"-", "_"}
-    )
-
-    if safe_run_id != run_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid run ID.",
-        )
-
-    output_file = (
-        OUTPUTS_DIR
-        / safe_run_id
-        / "blog.md"
-    )
-
+    check_run_id(run_id)
+    run_dir = OUTPUTS_DIR / run_id
+    output_file = run_dir / "blog.md"
     if not output_file.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Generated Markdown file was not found.",
-        )
+        raise HTTPException(status_code=404, detail="Generated Markdown file was not found.")
 
-    return FileResponse(
-        path=output_file,
-        media_type="text/markdown",
-        filename=f"generated-blog-{safe_run_id[:8]}.md",
-    )
+    slug = f"generated-blog-{run_id[:8]}"
+    try:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        slug = meta.get("seo", {}).get("slug") or slug
+    except (OSError, ValueError):
+        pass
 
-
+    return FileResponse(path=output_file, media_type="text/markdown", filename=f"{slug}.md")
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
